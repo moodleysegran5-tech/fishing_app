@@ -598,7 +598,8 @@ elif bait_status == "Poor match":
 else:
     st.info("Select bait above to get bait matching advice.")
 
-bait_image_path = species.get("bait_image")
+bait_image_name = species.get("bait_image", "").split("/")[-1]
+bait_image_path = f"images/{bait_image_name}"
 st.subheader("🖼️ Finished Bait Presentation")
 if bait_image_path and os.path.exists(bait_image_path):
     st.image(bait_image_path, caption=f"{selected_species} bait presentation", use_container_width=True)
