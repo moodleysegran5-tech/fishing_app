@@ -1,0 +1,6 @@
+streamlit
+streamlit-geolocation
+geopy
+pandas
+folium
+streamlit-folium
