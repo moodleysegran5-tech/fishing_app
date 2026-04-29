@@ -1,26 +1,100 @@
-import streamlit as st
-from streamlit_geolocation import streamlit_geolocation
-from geopy.distance import geodesic
 import math
-import pandas as pd
-from datetime import datetime, date
-import folium
-from streamlit_folium import st_folium
 import os
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import folium
+import pandas as pd
 import requests
+import streamlit.components.v1 as components
+import streamlit as st
+from geopy.distance import geodesic
+from streamlit_folium import st_folium
+
+try:
+    from streamlit_geolocation import streamlit_geolocation
+except Exception:
+    streamlit_geolocation = None
+
+# =====================================================
+# CastIQ Pro vNext
+# Dynamic SA location search, coastline snapping, ranked spots,
+# bait-to-species correction, automatic tide UX, expanded SA species/regulations.
+# =====================================================
 
 st.set_page_config(page_title="CastIQ Pro", page_icon="🎣", layout="wide")
-
 st.title("🎣 CastIQ Pro")
 st.caption("AI Fishing Intelligence: WHERE to stand. WHERE to cast. WHAT bait to use.")
 
 FEEDBACK_FILE = "feedback_log.csv"
+API_CACHE_TTL_SECONDS = 1800
+APP_USER_AGENT = "CastIQ-Pro/1.0 (South Africa fishing planner; personal prototype)"
 
-# =====================================================
-# GLOBAL OPTIONS
-# =====================================================
+# ---------- Safe secrets: prevents StreamlitSecretNotFoundError ----------
+def safe_secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
 
-time_bucket_windows = {
+WORLD_TIDES_API_KEY = safe_secret("WORLD_TIDES_API_KEY", "")
+STORMGLASS_API_KEY = safe_secret("STORMGLASS_API_KEY", "")
+
+# ---------- Hardened API layer ----------
+API_ENDPOINTS = {
+    "open_meteo_weather": "https://api.open-meteo.com/v1/forecast",
+    "open_meteo_marine": "https://marine-api.open-meteo.com/v1/marine",
+    "nominatim": "https://nominatim.openstreetmap.org/search",
+    "overpass": "https://overpass-api.de/api/interpreter",
+    "worldtides": "https://www.worldtides.info/api/v3",
+    "stormglass_tide": "https://api.stormglass.io/v2/tide/extremes/point",
+}
+DEFAULT_HEADERS = {"User-Agent": APP_USER_AGENT, "Accept": "application/json"}
+
+def api_key_status() -> Dict[str, str]:
+    return {
+        "Open-Meteo": "Ready - no key required",
+        "Nominatim": "Ready - no key required",
+        "Overpass / OSM": "Ready - no key required",
+        "WorldTides": "Configured" if bool(WORLD_TIDES_API_KEY) else "Not configured - fallback active",
+        "Stormglass": "Configured" if bool(STORMGLASS_API_KEY) else "Not configured - fallback active",
+    }
+
+def safe_api_json(method: str, url: str, *, params: Optional[Dict] = None, data: Optional[Dict] = None,
+                  headers: Optional[Dict] = None, timeout: int = 12, retries: int = 1,
+                  label: str = "API") -> Tuple[Optional[Dict], Optional[str]]:
+    request_headers = DEFAULT_HEADERS.copy()
+    if headers:
+        request_headers.update(headers)
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            if method.upper() == "POST":
+                response = requests.post(url, params=params, data=data, headers=request_headers, timeout=timeout)
+            else:
+                response = requests.get(url, params=params, headers=request_headers, timeout=timeout)
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            response.raise_for_status()
+            return response.json(), None
+        except Exception as e:
+            last_error = f"{label} issue: {e}"
+            if attempt < retries:
+                time.sleep(0.8 * (attempt + 1))
+    return None, last_error
+
+def safe_list_get(values, idx, default=None):
+    try:
+        if values is None or idx is None or idx >= len(values):
+            return default
+        return values[idx]
+    except Exception:
+        return default
+
+
+TIME_BUCKET_WINDOWS = {
     "Early Morning": "04:30 – 07:30",
     "Morning": "07:30 – 10:30",
     "Midday": "10:30 – 14:30",
@@ -29,8 +103,7 @@ time_bucket_windows = {
     "Night": "20:00 – 23:59",
     "Midnight": "00:00 – 04:30",
 }
-
-time_bucket_hour = {
+TIME_BUCKET_HOUR = {
     "Early Morning": 6,
     "Morning": 9,
     "Midday": 12,
@@ -40,1403 +113,778 @@ time_bucket_hour = {
     "Midnight": 2,
 }
 
-all_baits = [
-    "Sardine", "Chokka", "Mackerel", "Red bait", "Prawn", "Mussel",
-    "Cracker shrimp", "Worm", "Live mullet", "Fish head", "Octopus",
-    "Bonito", "Spoon lure", "Paddle tail lure", "Small crab",
-    "Crayfish", "Fish fillet"
+ALL_BAITS = [
+    "Sardine", "Chokka", "Mackerel", "Red bait", "Prawn", "Mussel", "Cracker shrimp", "Worm",
+    "Live mullet", "Fish head", "Octopus", "Bonito", "Spoon lure", "Paddle tail lure", "Small crab",
+    "Crayfish", "Fish fillet", "White mussel", "Bloodworm", "Sand prawn", "Pilchard", "Squid",
 ]
 
-bait_image_lookup = {
-    "Sardine": "images/sardine_bait.png",
-    "Chokka": "images/chokka_bait.png",
-    "Prawn": "images/prawn_bait.png",
-    "Mackerel": "images/mackerel_bait.png",
-    "Live mullet": "images/live_mullet_bait.png",
-    "Fish head": "images/fish_head_bait.png",
-    "Octopus": "images/octopus_bait.png",
-    "Mussel": "images/mussel_bait.png",
-    "Red bait": "images/red_bait.png",
-    "Cracker shrimp": "images/cracker_shrimp_bait.png",
-    "Worm": "images/worm_bait.png",
-    "Spoon lure": "images/spoon_lure_bait.png",
-    "Paddle tail lure": "images/paddle_tail_lure_bait.png",
-    "Small crab": "images/small_crab_bait.png",
-    "Crayfish": "images/crayfish_bait.png",
-    "Fish fillet": "images/fish_fillet_bait.png",
-    "Bonito": "images/bonito_bait.png",
+AREA_LOCATIONS = {
+    "Umhlanga": (-29.7245, 31.0856),
+    "Durban": (-29.8587, 31.0218),
+    "Ballito": (-29.5380, 31.2144),
+    "Scottburgh": (-30.2867, 30.7532),
+    "Port Edward": (-31.0507, 30.2279),
+    "Leisure Bay": (-30.9933, 30.2655),
+    "Trafalgar": (-30.9579, 30.3008),
+    "Palm Beach": (-30.9898, 30.2768),
+    "Southbroom": (-30.9192, 30.3287),
+    "Cape Town": (-33.9249, 18.4241),
+    "Mossel Bay": (-34.1831, 22.1460),
+    "Gqeberha / Port Elizabeth": (-33.9608, 25.6022),
+    "East London": (-33.0292, 27.8546),
 }
 
-# =====================================================
-# PLANNING AREAS
-# These are area anchors. The app then searches detailed fishing spots nearby.
-# =====================================================
-
-area_locations = {
-    "Leisure Bay": (-30.823900, 30.406200),
-    "Trafalgar": (-30.833900, 30.410500),
-    "Palm Beach": (-30.867000, 30.382300),
-    "Southbroom": (-30.919200, 30.328700),
-    "Umhlanga Lighthouse": (-29.717820, 31.089420),
-    "Umhlanga Lagoon Mouth": (-29.720500, 31.088000),
-    "Bronze Beach": (-29.713900, 31.092000),
+# Seeded micro-spots. Dynamic search will also create OSM spots around any SA location.
+FISHING_SPOTS = {
+    "Umhlanga Lighthouse Gully": {"area": "Umhlanga", "stand": (-29.7256, 31.0886), "feature_type": "gully", "structure": "Rocky gully and white-water edge near lighthouse", "confidence": 80, "species": ["Kob", "Shad", "Garrick", "Blacktail", "Bronze Bream", "Kingfish"], "notes": "Fish the gully edge; use caution on rocks."},
+    "Umhlanga Lagoon Mouth Current Seam": {"area": "Umhlanga", "stand": (-29.7155, 31.0934), "feature_type": "river mouth", "structure": "Lagoon-mouth current seam meeting surf line", "confidence": 82, "species": ["Garrick", "Kob", "Spotted Grunter", "Shad", "Pompano"], "notes": "Best around moving tide and clean working water."},
+    "Bronze Beach White-Water Section": {"area": "Umhlanga", "stand": (-29.7119, 31.0956), "feature_type": "white water", "structure": "Sandbank drop-off with working white water", "confidence": 76, "species": ["Shad", "Kob", "Garrick", "Pompano", "Grey Shark"], "notes": "Good for Shad when water is active."},
+    "Ballito Salmon Bay": {"area": "Ballito", "stand": (-29.5350, 31.2196), "feature_type": "beach", "structure": "Beach and rock-sand transition", "confidence": 74, "species": ["Shad", "Kob", "Blacktail", "Garrick"], "notes": "Look for deeper water and working foam lines."},
+    "Salt Rock Main Beach": {"area": "Salt Rock", "stand": (-29.5008, 31.2363), "feature_type": "beach", "structure": "Beach break with scattered reef influence", "confidence": 72, "species": ["Shad", "Kob", "Garrick", "Pompano"], "notes": "Fish early morning or evening."},
+    "Southbroom River-Mouth Channel": {"area": "Southbroom", "stand": (-30.9192, 30.3287), "feature_type": "river mouth", "structure": "River-mouth influence with deeper channel", "confidence": 76, "species": ["Kob", "Garrick", "Spotted Grunter", "Pompano", "Shad"], "notes": "Fish the channel seam on moving tide."},
+    "Trafalgar Rock-Sand Transition": {"area": "Trafalgar", "stand": (-30.9579, 30.3008), "feature_type": "gully", "structure": "Rock and sand transition with feeding gully", "confidence": 82, "species": ["Kob", "Shad", "Bronze Bream", "Blacktail", "Grey Shark"], "notes": "Target the edge, not the middle."},
+    "Palm Beach White-Water Channel": {"area": "Palm Beach", "stand": (-30.9898, 30.2768), "feature_type": "white water", "structure": "Working white water with channel edge", "confidence": 74, "species": ["Shad", "Kob", "Garrick", "Bronze Bream", "Blacktail", "Pompano"], "notes": "Good if water is working."},
+    "Port Edward Rocky Point": {"area": "Port Edward", "stand": (-31.0507, 30.2279), "feature_type": "rock", "structure": "Rocky point and gully water", "confidence": 78, "species": ["Kob", "Shad", "Bronze Bream", "Blacktail", "Musselcracker"], "notes": "Safety first; avoid big swell."},
+    "Muizenberg / False Bay Strand": {"area": "Cape Town", "stand": (-34.1075, 18.4695), "feature_type": "beach", "structure": "Long surf beach with sand channels", "confidence": 72, "species": ["Kob", "White Steenbras", "Galjoen", "Spotted Grunter"], "notes": "Look for holes and channels."},
+    "Strand Beach": {"area": "Cape Town", "stand": (-34.1141, 18.8244), "feature_type": "beach", "structure": "Surf beach with channels", "confidence": 70, "species": ["Kob", "White Steenbras", "Galjoen"], "notes": "Works best around cleaner water and moving tide."},
 }
 
-# =====================================================
-# HELPER FUNCTIONS
-# =====================================================
+# ---------- Species intelligence ----------
+def sp(ideal, time_bonus, trace, bite, feel, response, mistake, group="General", diagram="Main line | sinker | swivel | leader | hook"):
+    return {"ideal_baits": ideal, "time_bonus": time_bonus, "trace": trace, "bite_style": bite, "feel": feel, "response": response, "mistake": mistake, "group": group, "trace_diagram": diagram}
 
-def calculate_bearing(start, end):
-    lat1, lon1 = map(math.radians, start)
-    lat2, lon2 = map(math.radians, end)
-    dlon = lon2 - lon1
+SPECIES: Dict[str, Dict] = {
+    "Kob": sp(["Chokka", "Sardine", "Mackerel", "Live mullet", "Fish fillet", "Squid", "Pilchard"], ["Early Morning", "Evening", "Night", "Midnight"], "Sliding sinker trace", "Soft pickup → suction feed → slow run", "Light taps then rod loads", "Wait for rod to load, then lift firmly", "Striking too early", "Edible", "Main line | running sinker | swivel | 0.70mm leader | 5/0-7/0 hooks"),
+    "Shad": sp(["Sardine", "Pilchard", "Chokka", "Spoon lure", "Mackerel"], ["Early Morning", "Morning", "Afternoon", "Evening"], "Short steel trace", "Fast repeated hits", "Sharp knocks and fast tapping", "Strike quickly and keep pressure", "Leaving bait too static", "Edible", "Main line | swivel | short steel | 1/0-3/0 hook"),
+    "Garrick": sp(["Live mullet", "Paddle tail lure", "Spoon lure", "Mackerel"], ["Morning", "Afternoon", "Evening"], "Live bait trace", "Aggressive grab → fast run", "Sharp pull and line speed", "Let circle hook set under pressure", "Striking too hard too early", "Gamefish", "Main line | swivel | leader | 6/0-8/0 circle hook"),
+    "Spotted Grunter": sp(["Cracker shrimp", "Sand prawn", "Prawn", "Worm", "Sardine"], ["Early Morning", "Morning", "Evening"], "Light sliding trace", "Gentle pickup and run", "Small taps then steady pull", "Feed line, then tighten smoothly", "Using tackle too heavy", "Edible"),
+    "Bronze Bream": sp(["Prawn", "Red bait", "Mussel", "Crayfish", "White mussel"], ["Morning", "Afternoon"], "Short scratching trace", "Small taps → firm pull", "Pecks then strong pull into rocks", "Lift firmly once committed", "Fishing too far out", "Reef"),
+    "Blacktail": sp(["Prawn", "Red bait", "Mussel", "Cracker shrimp", "Worm"], ["Morning", "Afternoon", "Evening"], "Light scratching trace", "Quick pecks and small pulls", "Taps and nibbles", "Strike gently and keep tension", "Oversized hooks", "Reef"),
+    "Pompano": sp(["Prawn", "Cracker shrimp", "Worm", "Small crab", "Sand prawn"], ["Morning", "Afternoon", "Evening"], "Light surf trace", "Quick pickup in shallow surf", "Sharp taps then pull", "Lift and wind steadily", "Fishing beyond the feeding zone", "Edible"),
+    "White Steenbras": sp(["Worm", "Sand prawn", "Prawn", "White mussel", "Cracker shrimp"], ["Early Morning", "Morning", "Evening"], "Long sandy beach trace", "Slow pickup and heavy pull", "Rod slowly loads", "Let it commit, then lift", "Too much tension too early", "Edible"),
+    "Sand Steenbras": sp(["Worm", "Sand prawn", "Prawn", "White mussel"], ["Morning", "Afternoon", "Evening"], "Light sandy trace", "Subtle pickup", "Light taps", "Gentle lift", "Overpowering light fish", "Edible"),
+    "Galjoen": sp(["Red bait", "White mussel", "Mussel", "Worm"], ["Morning", "Afternoon"], "Short rocky-water trace", "Hard bite in foamy water", "Heavy knock", "Lift and keep clear of rocks", "Fishing calm clean water only", "Reef"),
+    "Musselcracker": sp(["Crab", "Small crab", "Crayfish", "Red bait", "Mussel", "Octopus"], ["Morning", "Afternoon"], "Heavy reef trace", "Powerful pull into structure", "Rod buckles hard", "Lock up and pull away from reef", "Fishing too light", "Reef"),
+    "Kingfish": sp(["Live mullet", "Paddle tail lure", "Spoon lure", "Bonito", "Mackerel"], ["Morning", "Afternoon", "Evening"], "Lure/livebait trace", "Fast ambush hit", "Line accelerates", "Keep pressure and let drag work", "Drag too tight", "Gamefish"),
+    "Queenfish": sp(["Spoon lure", "Paddle tail lure", "Live mullet", "Sardine"], ["Morning", "Afternoon"], "Light lure trace", "Fast surface hit", "Sudden strike", "Keep lure moving", "Slow retrieve", "Gamefish"),
+    "Wave Garrick": sp(["Sardine", "Prawn", "Spoon lure", "Worm"], ["Morning", "Afternoon", "Evening"], "Light surf trace", "Sharp little hits in wash", "Fast taps", "Strike lightly", "Hooks too large", "Edible"),
+    "Grey Shark": sp(["Mackerel", "Fish head", "Bonito", "Sardine", "Octopus"], ["Evening", "Night", "Midnight"], "Steel shark trace", "Pickup then strong run", "Line peels off", "Let it run then set pressure", "Weak steel/leader", "Sport"),
+    "Sand Shark": sp(["Mackerel", "Sardine", "Fish head", "Squid"], ["Evening", "Night"], "Shark trace", "Slow heavy pickup", "Rod loads slowly", "Apply steady pressure", "Fishing too light", "Sport"),
+    "Ragged Tooth Shark": sp(["Mackerel", "Bonito", "Fish head", "Octopus"], ["Evening", "Night"], "Heavy shark trace", "Slow pickup then run", "Heavy sustained pull", "Use correct heavy tackle", "Unsafe handling", "Sport"),
+    "Bronze Whaler": sp(["Bonito", "Mackerel", "Fish head", "Octopus"], ["Evening", "Night"], "Heavy slide/swim-bait trace", "Powerful long run", "Fast line loss", "Use heavy tackle and safety plan", "Fishing alone", "Sport"),
+    "Hammerhead": sp(["Mackerel", "Bonito", "Fish head"], ["Evening", "Night"], "Heavy shark trace", "Powerful run", "Hard sustained pressure", "Use safe release handling", "Unsafe handling", "Sport"),
+    "Rockcod": sp(["Prawn", "Crayfish", "Small crab", "Octopus", "Fish fillet"], ["Morning", "Afternoon", "Evening"], "Strong reef trace", "Grab and dive", "Heavy knock into reef", "Pull immediately", "Allowing fish into reef", "Reef"),
+    "Stumpnose": sp(["Prawn", "Worm", "White mussel", "Cracker shrimp"], ["Morning", "Afternoon"], "Light scratching trace", "Pecks then pull", "Light taps", "Lift smoothly", "Oversized bait", "Edible"),
+}
 
-    x = math.sin(dlon) * math.cos(lat2)
-    y = (
-        math.cos(lat1) * math.sin(lat2)
-        - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
-    )
+REGULATIONS = {
+    "Kob": {"bag": "Varies by area/species", "min_size": "Verify local rule", "closed": "Verify", "protected": "No", "mpa": "Check MPA", "feedback": "Kob rules vary; verify before keeping."},
+    "Shad": {"bag": "4", "min_size": "30 cm", "closed": "Seasonal closure applies", "protected": "No", "mpa": "Check MPA", "feedback": "Do not keep during closure."},
+    "Garrick": {"bag": "2", "min_size": "70 cm", "closed": "Verify", "protected": "No", "mpa": "Check MPA", "feedback": "Popular catch-and-release species."},
+    "Spotted Grunter": {"bag": "Verify", "min_size": "Verify", "closed": "Open/verify", "protected": "No", "mpa": "Check MPA", "feedback": "Verify local estuary/shore rules."},
+    "Bronze Bream": {"bag": "2", "min_size": "30 cm", "closed": "Open/verify", "protected": "No", "mpa": "Check MPA", "feedback": "Commonly restricted reef fish."},
+    "Blacktail": {"bag": "5", "min_size": "20 cm", "closed": "Open", "protected": "No", "mpa": "Check MPA", "feedback": "Verify current rules."},
+    "Pompano": {"bag": "Verify", "min_size": "Verify", "closed": "Open/verify", "protected": "No", "mpa": "Check MPA", "feedback": "Verify current rules."},
+    "White Steenbras": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "Often sensitive", "mpa": "Check MPA", "feedback": "Strongly verify before keeping."},
+    "Sand Steenbras": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Verify current rules."},
+    "Galjoen": {"bag": "Verify", "min_size": "Verify", "closed": "Seasonal restrictions may apply", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Verify local seasonal rules."},
+    "Musselcracker": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Slow-growing reef fish; verify rules."},
+    "Kingfish": {"bag": "Verify", "min_size": "Verify", "closed": "Open/verify", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Often released by sport anglers."},
+    "Queenfish": {"bag": "Verify", "min_size": "Verify", "closed": "Open/verify", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Verify current rules."},
+    "Wave Garrick": {"bag": "Verify", "min_size": "Verify", "closed": "Open/verify", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Verify current rules."},
+    "Grey Shark": {"bag": "Catch/release advised", "min_size": "Verify", "closed": "Verify", "protected": "Verify", "mpa": "Check MPA", "feedback": "Use safe release handling."},
+    "Sand Shark": {"bag": "Catch/release advised", "min_size": "Verify", "closed": "Verify", "protected": "Verify", "mpa": "Check MPA", "feedback": "Use safe release handling."},
+    "Ragged Tooth Shark": {"bag": "Catch/release advised", "min_size": "Verify", "closed": "Verify", "protected": "Verify", "mpa": "Check MPA", "feedback": "Handle carefully; verify protection status."},
+    "Bronze Whaler": {"bag": "Catch/release advised", "min_size": "Verify", "closed": "Verify", "protected": "Verify", "mpa": "Check MPA", "feedback": "Use safe release handling."},
+    "Hammerhead": {"bag": "Catch/release advised", "min_size": "Verify", "closed": "Verify", "protected": "Verify", "mpa": "Check MPA", "feedback": "Verify current protected species rules."},
+    "Rockcod": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "Some species protected", "mpa": "Check MPA", "feedback": "Species-level ID matters."},
+    "Stumpnose": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "No/verify", "mpa": "Check MPA", "feedback": "Verify local rules."},
+}
+REG_TABLE = pd.DataFrame([{ "Fish": k, **v } for k, v in REGULATIONS.items()])
 
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
+# ---------- Geography / coastline engine ----------
+def destination_point(start: Tuple[float, float], bearing_deg: float, distance_m: float) -> Tuple[float, float]:
+    lat1 = math.radians(start[0]); lon1 = math.radians(start[1]); brng = math.radians(bearing_deg); d = distance_m / 6371000
+    lat2 = math.asin(math.sin(lat1)*math.cos(d) + math.cos(lat1)*math.sin(d)*math.cos(brng))
+    lon2 = lon1 + math.atan2(math.sin(brng)*math.sin(d)*math.cos(lat1), math.cos(d)-math.sin(lat1)*math.sin(lat2))
+    return (math.degrees(lat2), math.degrees(lon2))
 
+def calculate_bearing(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    lat1, lat2 = math.radians(a[0]), math.radians(b[0])
+    dlon = math.radians(b[1]-a[1])
+    y = math.sin(dlon)*math.cos(lat2)
+    x = math.cos(lat1)*math.sin(lat2)-math.sin(lat1)*math.cos(lat2)*math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
 
-def bearing_to_compass(bearing):
-    directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"]
-    return directions[round(bearing / 45)]
-
-
-def confidence_label(score):
-    if score >= 85:
-        return "Very High"
-    if score >= 75:
-        return "High"
-    if score >= 60:
-        return "Medium"
-    return "Low"
-
-
-def bait_match_engine(available_baits, ideal_baits):
-    if not available_baits:
-        return "No bait selected", [], "No bait selected. The app will recommend ideal bait only."
-
-    ideal_lower = [x.lower() for x in ideal_baits]
-    matched = [bait for bait in available_baits if bait.lower() in ideal_lower]
-
-    if matched:
-        return "Good match", matched, f"You have suitable bait: {', '.join(matched)}."
-
-    return "Poor match", [], f"Your bait is not ideal. Best bait: {', '.join(ideal_baits)}."
-
+def bearing_to_compass(b: float) -> str:
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    return dirs[int((b + 11.25) / 22.5) % 16]
 
 def direction_text(deg):
-    if deg is None:
-        return "Unknown"
-    dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"]
-    return dirs[round(deg / 45)]
+    if deg is None: return "unknown"
+    return f"{int(deg)}° {bearing_to_compass(float(deg))}"
+
+def point_to_segment_distance_m(p, a, b):
+    # Approximate projection in local metres.
+    lat0 = math.radians(p[0])
+    def xy(q):
+        return ((q[1] - p[1]) * 111320 * math.cos(lat0), (q[0] - p[0]) * 110540)
+    px, py = 0, 0; ax, ay = xy(a); bx, by = xy(b)
+    dx, dy = bx-ax, by-ay
+    if dx == 0 and dy == 0:
+        return geodesic(p, a).meters, a
+    t = max(0, min(1, ((px-ax)*dx + (py-ay)*dy)/(dx*dx + dy*dy)))
+    cx, cy = ax + t*dx, ay + t*dy
+    lat = p[0] + cy/110540
+    lon = p[1] + cx/(111320*math.cos(lat0))
+    return math.hypot(cx, cy), (lat, lon)
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def geocode_sa_location(query: str) -> Optional[Dict]:
+    if not query.strip():
+        return None
+    data, err = safe_api_json("GET", API_ENDPOINTS["nominatim"], params={
+        "q": f"{query}, South Africa", "format": "json", "limit": 5,
+        "countrycodes": "za", "addressdetails": 1}, timeout=12, retries=1, label="Location search")
+    if err or not data:
+        return None
+    best = data[0]
+    return {"lat": float(best["lat"]), "lon": float(best["lon"]), "display_name": best.get("display_name", query)}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_osm_beach_spots(lat: float, lon: float, radius_m: int) -> List[Dict]:
+    query = f"""
+    [out:json][timeout:20];
+    (
+      node(around:{radius_m},{lat},{lon})["natural"="beach"];
+      way(around:{radius_m},{lat},{lon})["natural"="beach"];
+      node(around:{radius_m},{lat},{lon})["leisure"="beach_resort"];
+      way(around:{radius_m},{lat},{lon})["leisure"="beach_resort"];
+      node(around:{radius_m},{lat},{lon})["waterway"="riverbank"];
+      node(around:{radius_m},{lat},{lon})["natural"="bay"];
+    );
+    out center tags 30;
+    """
+    data, err = safe_api_json("POST", API_ENDPOINTS["overpass"], data={"data": query}, timeout=25, retries=1, label="OSM beach search")
+    if err or not data:
+        return []
+    out = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        plat, plon = el.get("lat"), el.get("lon")
+        if plat is None and "center" in el:
+            plat, plon = el["center"].get("lat"), el["center"].get("lon")
+        if plat is None:
+            continue
+        name = tags.get("name") or tags.get("name:en") or tags.get("natural") or "OSM coastal feature"
+        out.append({"name": name, "lat": float(plat), "lon": float(plon), "tags": tags})
+    seen, clean = set(), []
+    for o in out:
+        key = (o["name"].lower(), round(o["lat"], 3), round(o["lon"], 3))
+        if key not in seen:
+            seen.add(key); clean.append(o)
+    return clean[:25]
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_coastline_nodes(lat: float, lon: float, radius_m: int = 12000) -> List[Tuple[float, float]]:
+    query = f"""
+    [out:json][timeout:25];
+    way(around:{radius_m},{lat},{lon})["natural"="coastline"];
+    (._;>;);
+    out body;
+    """
+    data, err = safe_api_json("POST", API_ENDPOINTS["overpass"], data={"data": query}, timeout=30, retries=1, label="OSM coastline")
+    if err or not data:
+        return []
+    nodes = []
+    for el in data.get("elements", []):
+        if el.get("type") == "node" and "lat" in el and "lon" in el:
+            nodes.append((float(el["lat"]), float(el["lon"])))
+    return nodes
+
+def estimate_sea_bearing(coast_point: Tuple[float, float]) -> float:
+    # SA ocean is generally east/south-east on KZN/EC and south-west/south on Western Cape.
+    lat, lon = coast_point
+    if lon > 29: return 115
+    if lon > 24: return 150
+    if lon > 19: return 180
+    return 240
+
+def coastline_snap_engine(origin: Tuple[float, float], inland_m: int = 55, cast_m: int = 85) -> Dict:
+    nodes = fetch_coastline_nodes(origin[0], origin[1], 15000)
+    if len(nodes) >= 2:
+        best_dist, best_point = float("inf"), None
+        for i in range(len(nodes)-1):
+            d, p = point_to_segment_distance_m(origin, nodes[i], nodes[i+1])
+            if d < best_dist:
+                best_dist, best_point = d, p
+        coast = best_point or min(nodes, key=lambda n: geodesic(origin, n).meters)
+        sea_bearing = estimate_sea_bearing(coast)
+        stand = destination_point(coast, (sea_bearing + 180) % 360, inland_m)
+        cast = destination_point(coast, sea_bearing, cast_m)
+        return {"stand": stand, "cast": cast, "coast": coast, "sea_bearing": sea_bearing, "source": "OSM coastline", "distance_to_coast_m": int(best_dist)}
+    # fallback: move to nearest seeded coastal spot if inland/unknown
+    nearest = min(FISHING_SPOTS.values(), key=lambda s: geodesic(origin, s["stand"]).km)
+    coast = nearest["stand"]
+    sea_bearing = estimate_sea_bearing(coast)
+    stand = destination_point(coast, (sea_bearing + 180) % 360, inland_m)
+    cast = destination_point(coast, sea_bearing, cast_m)
+    return {"stand": stand, "cast": cast, "coast": coast, "sea_bearing": sea_bearing, "source": "Seeded coastline fallback", "distance_to_coast_m": int(geodesic(origin, coast).meters)}
 
 
-def weather_code_text(code):
-    codes = {
-        0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-        45: "Fog", 48: "Fog / mist", 51: "Light drizzle",
-        53: "Moderate drizzle", 55: "Dense drizzle", 61: "Slight rain",
-        63: "Moderate rain", 65: "Heavy rain", 80: "Rain showers",
-        81: "Moderate showers", 82: "Heavy showers", 95: "Thunderstorm",
-    }
-    return codes.get(code, "Weather condition")
+def build_navigation_plan(user_point: Tuple[float, float], stand_point: Tuple[float, float], cast_point: Tuple[float, float], sea_bearing: float, spot_name: str, spot: Dict) -> Dict:
+    """Two-stage navigation: drive to parking/access, then walk to stand."""
+    parking = spot.get("parking")
+    if not parking:
+        parking = destination_point(stand_point, (sea_bearing + 180) % 360, 420)
+    parking_note = spot.get("parking_note", "Estimated public access/parking point. Confirm signage, safety and legal parking before leaving your vehicle.")
+    walk_distance_m = int(geodesic(parking, stand_point).meters)
+    face_bearing = int(calculate_bearing(stand_point, cast_point))
+    face_compass = bearing_to_compass(face_bearing)
+    instructions = spot.get("walk_instructions") or [
+        f"Drive to the parking or beach access point for {spot_name}.",
+        "Park only where it is legal and visible. Do not leave valuables in the vehicle.",
+        f"From parking, walk roughly {walk_distance_m} metres towards the beach access and shoreline.",
+        "Stop at the marked stand point on dry, safe ground above the wash line.",
+        f"Face {face_bearing} degrees {face_compass}.",
+        f"Cast approximately {int(geodesic(stand_point, cast_point).meters)} metres towards the target marker.",
+        "Watch at least three wave sets before stepping near rocks, gullies or river-mouth water.",
+    ]
+    return {"parking": parking, "parking_note": parking_note, "walk_distance_m": walk_distance_m, "face_bearing": face_bearing, "face_compass": face_compass, "instructions": instructions}
 
+def google_nav_url(origin: Tuple[float, float], dest: Tuple[float, float], mode: str = "driving") -> str:
+    return f"https://www.google.com/maps/dir/?api=1&origin={origin[0]},{origin[1]}&destination={dest[0]},{dest[1]}&travelmode={mode}"
 
-def moon_phase_name(d):
-    known_new_moon = date(2000, 1, 6)
-    days = (d - known_new_moon).days
-    lunation = 29.53058867
-    phase = (days % lunation) / lunation
-
-    if phase < 0.03 or phase > 0.97:
-        return "New Moon"
-    if phase < 0.22:
-        return "Waxing Crescent"
-    if phase < 0.28:
-        return "First Quarter"
-    if phase < 0.47:
-        return "Waxing Gibbous"
-    if phase < 0.53:
-        return "Full Moon"
-    if phase < 0.72:
-        return "Waning Gibbous"
-    if phase < 0.78:
-        return "Last Quarter"
-    return "Waning Crescent"
-
-
-def moon_fishing_effect(phase):
-    if phase in ["New Moon", "Full Moon"]:
-        return 8, "New/full moon may increase tidal movement."
-    if phase in ["First Quarter", "Last Quarter"]:
-        return 3, "Moderate moon influence."
-    return 1, "Lower moon-driven tidal influence."
-
-
-def fetch_conditions(lat, lon, trip_date, bucket):
-    target_hour = time_bucket_hour.get(bucket, 12)
-    target_date = trip_date.strftime("%Y-%m-%d")
-
-    result = {"available": False, "weather_error": None, "marine_error": None}
-
-    weather_url = "https://api.open-meteo.com/v1/forecast"
-    weather_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": ",".join([
-            "temperature_2m", "precipitation_probability", "weather_code",
-            "wind_speed_10m", "wind_direction_10m", "pressure_msl", "cloud_cover"
-        ]),
-        "timezone": "auto",
-        "forecast_days": 10,
-    }
-
-    marine_url = "https://marine-api.open-meteo.com/v1/marine"
-    marine_params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": ",".join([
-            "wave_height", "wave_period", "wave_direction", "sea_surface_temperature"
-        ]),
-        "timezone": "auto",
-        "forecast_days": 10,
-    }
-
-    try:
-        w = requests.get(weather_url, params=weather_params, timeout=10).json()
-        times = w.get("hourly", {}).get("time", [])
-        idx = None
-
-        for i, t in enumerate(times):
-            if t.startswith(target_date) and int(t[11:13]) == target_hour:
-                idx = i
-                break
-
-        if idx is None and times:
-            idx = 0
-
+def waze_nav_url(dest: Tuple[float, float]) -> str:
+    return f"https://waze.com/ul?ll={dest[0]},{dest[1]}&navigate=yes"
+# ---------- API/weather/tide ----------
+@st.cache_data(ttl=API_CACHE_TTL_SECONDS)
+def fetch_conditions(lat, lon, trip_date_str, bucket):
+    target_hour = TIME_BUCKET_HOUR.get(bucket, 12)
+    result = {"available": False, "weather_error": None, "marine_error": None, "weather_source": "Open-Meteo", "marine_source": "Open-Meteo Marine"}
+    weather, err = safe_api_json("GET", API_ENDPOINTS["open_meteo_weather"], params={
+        "latitude": lat, "longitude": lon,
+        "hourly": "temperature_2m,precipitation_probability,weather_code,wind_speed_10m,wind_direction_10m,pressure_msl,cloud_cover,wind_gusts_10m,visibility",
+        "timezone": "auto", "forecast_days": 10}, timeout=12, retries=1, label="Open-Meteo weather")
+    if err:
+        result["weather_error"] = err
+    if weather:
+        times = weather.get("hourly", {}).get("time", [])
+        idx = next((i for i, t in enumerate(times) if t.startswith(trip_date_str) and int(t[11:13]) == target_hour), 0 if times else None)
         if idx is not None:
-            h = w["hourly"]
-            result.update({
-                "available": True,
-                "temperature": h.get("temperature_2m", [None])[idx],
-                "rain_probability": h.get("precipitation_probability", [None])[idx],
-                "weather_code": h.get("weather_code", [None])[idx],
-                "wind_speed": h.get("wind_speed_10m", [None])[idx],
-                "wind_direction": h.get("wind_direction_10m", [None])[idx],
-                "pressure": h.get("pressure_msl", [None])[idx],
-                "cloud_cover": h.get("cloud_cover", [None])[idx],
-            })
-    except Exception as e:
-        result["weather_error"] = str(e)
-
-    try:
-        m = requests.get(marine_url, params=marine_params, timeout=10).json()
-        times = m.get("hourly", {}).get("time", [])
-        idx = None
-
-        for i, t in enumerate(times):
-            if t.startswith(target_date) and int(t[11:13]) == target_hour:
-                idx = i
-                break
-
-        if idx is None and times:
-            idx = 0
-
+            h = weather.get("hourly", {})
+            result.update({"available": True, "temperature": safe_list_get(h.get("temperature_2m"), idx), "rain_probability": safe_list_get(h.get("precipitation_probability"), idx), "weather_code": safe_list_get(h.get("weather_code"), idx), "wind_speed": safe_list_get(h.get("wind_speed_10m"), idx), "wind_direction": safe_list_get(h.get("wind_direction_10m"), idx), "pressure": safe_list_get(h.get("pressure_msl"), idx), "cloud_cover": safe_list_get(h.get("cloud_cover"), idx), "wind_gusts": safe_list_get(h.get("wind_gusts_10m"), idx), "visibility": safe_list_get(h.get("visibility"), idx)})
+    marine, err = safe_api_json("GET", API_ENDPOINTS["open_meteo_marine"], params={
+        "latitude": lat, "longitude": lon,
+        "hourly": "wave_height,wave_period,wave_direction,sea_surface_temperature,swell_wave_height,swell_wave_period,swell_wave_direction",
+        "timezone": "auto", "forecast_days": 10}, timeout=12, retries=1, label="Open-Meteo marine")
+    if err:
+        result["marine_error"] = err
+    if marine:
+        times = marine.get("hourly", {}).get("time", [])
+        idx = next((i for i, t in enumerate(times) if t.startswith(trip_date_str) and int(t[11:13]) == target_hour), 0 if times else None)
         if idx is not None:
-            h = m["hourly"]
-            result.update({
-                "wave_height": h.get("wave_height", [None])[idx],
-                "wave_period": h.get("wave_period", [None])[idx],
-                "wave_direction": h.get("wave_direction", [None])[idx],
-                "sea_temp": h.get("sea_surface_temperature", [None])[idx],
-            })
-    except Exception as e:
-        result["marine_error"] = str(e)
-
+            h = marine.get("hourly", {})
+            result.update({"wave_height": safe_list_get(h.get("wave_height"), idx), "wave_period": safe_list_get(h.get("wave_period"), idx), "wave_direction": safe_list_get(h.get("wave_direction"), idx), "sea_temp": safe_list_get(h.get("sea_surface_temperature"), idx), "swell_height": safe_list_get(h.get("swell_wave_height"), idx), "swell_period": safe_list_get(h.get("swell_wave_period"), idx), "swell_direction": safe_list_get(h.get("swell_wave_direction"), idx)})
     return result
 
+def _normalise_tide_time(raw_time):
+    try:
+        if isinstance(raw_time, (int, float)):
+            return datetime.fromtimestamp(raw_time)
+        if isinstance(raw_time, str):
+            return datetime.fromisoformat(raw_time.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+    return None
 
-def condition_score_engine(conditions, tide_stage, moon_phase, selected_species, time_bucket):
-    score = 50
-    positives = []
-    negatives = []
-
-    wind = conditions.get("wind_speed")
-    wave = conditions.get("wave_height")
-    period = conditions.get("wave_period")
-    rain = conditions.get("rain_probability")
-
-    if tide_stage in ["Pushing tide", "Outgoing tide"]:
-        score += 12
-        positives.append("Moving tide creates feeding current.")
-    elif tide_stage in ["High tide turning", "Low tide turning"]:
-        score += 5
-        positives.append("Turning tide can trigger short feeding windows.")
+def infer_tide_stage(extremes, target_dt=None):
+    if not extremes or len(extremes) < 2:
+        return None
+    clean = []
+    for e in extremes:
+        t = _normalise_tide_time(e.get("dt") or e.get("time") or e.get("date"))
+        typ = str(e.get("type", "")).lower()
+        if t and typ:
+            clean.append({"time": t, "type": typ, **e})
+    clean.sort(key=lambda x: x["time"])
+    if len(clean) >= 2:
+        target_dt = target_dt or datetime.now()
+        before = [e for e in clean if e["time"] <= target_dt]
+        after = [e for e in clean if e["time"] > target_dt]
+        first = (before[-1] if before else clean[0])["type"]
+        second = (after[0] if after else clean[-1])["type"]
     else:
-        score -= 4
-        negatives.append("Slack/unknown tide reduces confidence.")
+        first = str(extremes[0].get("type", "")).lower()
+        second = str(extremes[1].get("type", "")).lower()
+    if "low" in first and "high" in second:
+        return "Pushing tide"
+    if "high" in first and "low" in second:
+        return "Outgoing tide"
+    if "high" in first or "low" in first:
+        return "Turning tide"
+    return None
 
-    moon_bonus, moon_note = moon_fishing_effect(moon_phase)
-    score += moon_bonus
-    positives.append(moon_note)
+@st.cache_data(ttl=API_CACHE_TTL_SECONDS)
+def fetch_worldtides(lat, lon, trip_date_str, key):
+    if not key:
+        return {"available": False, "source": "WorldTides", "status": "No WORLD_TIDES_API_KEY configured", "next_tides": [], "stage": None}
+    data, err = safe_api_json("GET", API_ENDPOINTS["worldtides"], params={"extremes": "", "heights": "", "lat": lat, "lon": lon, "date": trip_date_str, "days": 1, "key": key}, timeout=12, retries=1, label="WorldTides")
+    if err or not data:
+        return {"available": False, "source": "WorldTides", "status": err or "WorldTides returned no data", "next_tides": [], "stage": None}
+    if data.get("error"):
+        return {"available": False, "source": "WorldTides", "status": f"WorldTides error: {data.get('error')}", "next_tides": [], "stage": None}
+    ex = data.get("extremes", [])
+    return {"available": bool(ex), "source": "WorldTides", "status": "Live tide loaded" if ex else "WorldTides returned no tide extremes", "next_tides": ex[:6], "stage": infer_tide_stage(ex)}
 
+@st.cache_data(ttl=API_CACHE_TTL_SECONDS)
+def fetch_stormglass(lat, lon, trip_date_str, key):
+    if not key:
+        return {"available": False, "source": "Stormglass", "status": "No STORMGLASS_API_KEY configured", "next_tides": [], "stage": None}
+    start = datetime.fromisoformat(trip_date_str); end = start + timedelta(days=1)
+    data, err = safe_api_json("GET", API_ENDPOINTS["stormglass_tide"], params={"lat": lat, "lng": lon, "start": start.isoformat(), "end": end.isoformat()}, headers={"Authorization": key}, timeout=12, retries=1, label="Stormglass")
+    if err or not data:
+        return {"available": False, "source": "Stormglass", "status": err or "Stormglass returned no data", "next_tides": [], "stage": None}
+    ex = data.get("data", [])
+    return {"available": bool(ex), "source": "Stormglass", "status": "Live tide loaded" if ex else "Stormglass returned no tide extremes", "next_tides": ex[:6], "stage": infer_tide_stage(ex)}
+
+def moon_phase_name(d):
+    known_new = datetime(2000, 1, 6).date(); days = (d - known_new).days; phase = (days % 29.53058867) / 29.53058867
+    if phase < 0.03 or phase > 0.97: return "New Moon"
+    if 0.47 < phase < 0.53: return "Full Moon"
+    if phase < 0.25: return "Waxing Crescent"
+    if phase < 0.47: return "Waxing Gibbous"
+    if phase < 0.75: return "Waning Gibbous"
+    return "Waning Crescent"
+
+def estimate_tide_stage(trip_date, bucket):
+    h = TIME_BUCKET_HOUR.get(bucket, 12); phase = moon_phase_name(trip_date)
+    if phase in ["New Moon", "Full Moon"] and h in [6, 18]: return "Estimated moving tide"
+    if h in [6, 18, 21]: return "Estimated pushing/outgoing tide"
+    return "Estimated tide unknown"
+
+def get_tide_data(lat, lon, trip_date, bucket, manual_override=None):
+    if manual_override and manual_override != "Auto":
+        return {"available": False, "source": "Manual override", "status": "Advanced manual override used", "next_tides": [], "stage": manual_override}
+    wt = fetch_worldtides(lat, lon, trip_date.strftime("%Y-%m-%d"), WORLD_TIDES_API_KEY)
+    if wt["available"] and wt.get("stage"): return wt
+    sg = fetch_stormglass(lat, lon, trip_date.strftime("%Y-%m-%d"), STORMGLASS_API_KEY)
+    if sg["available"] and sg.get("stage"): return sg
+    source_notes = []
+    if not WORLD_TIDES_API_KEY: source_notes.append("WorldTides key missing")
+    elif wt.get("status"): source_notes.append(wt["status"])
+    if not STORMGLASS_API_KEY: source_notes.append("Stormglass key missing")
+    elif sg.get("status"): source_notes.append(sg["status"])
+    return {"available": False, "source": "Estimated fallback", "status": "Live tide unavailable; using estimated tide. " + " | ".join(source_notes), "next_tides": [], "stage": estimate_tide_stage(trip_date, bucket)}
+
+# ---------- Scoring ----------
+def bait_match_engine(available_baits, ideal_baits):
+    if not available_baits:
+        return "No bait selected", [], "No bait selected. Recommendation will use ideal bait logic only."
+    matched = [b for b in available_baits if b in ideal_baits]
+    if matched:
+        return "Good match", matched, f"Good bait match: {', '.join(matched)}."
+    return "Poor match", [], f"Your bait ({', '.join(available_baits)}) does not properly match this target."
+
+def confidence_label(score):
+    if score >= 80: return "High"
+    if score >= 65: return "Good"
+    if score >= 50: return "Medium"
+    return "Low"
+
+def weather_code_text(code):
+    mapping = {0:"Clear",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",45:"Fog",48:"Fog",51:"Drizzle",61:"Rain",63:"Rain",65:"Heavy rain",80:"Showers",95:"Thunderstorm"}
+    return mapping.get(code, f"Code {code}" if code is not None else "unknown")
+
+def condition_score_engine(conditions, tide_stage, moon_phase, species, bucket):
+    score, pos, neg = 50, [], []
+    if any(x in tide_stage for x in ["Pushing", "Outgoing", "moving"]): score += 12; pos.append("Moving/estimated moving tide supports feeding.")
+    elif "Turning" in tide_stage: score += 5; pos.append("Turning tide can produce a short bite window.")
+    else: score -= 4; neg.append("Tide confidence is weak.")
+    if moon_phase in ["New Moon", "Full Moon"]: score += 8; pos.append("New/full moon may support stronger tide movement.")
+    wind, wave, period, rain = conditions.get("wind_speed"), conditions.get("wave_height"), conditions.get("wave_period"), conditions.get("rain_probability")
     if wind is not None:
-        if wind <= 25:
-            score += 8
-            positives.append("Wind speed appears fishable.")
-        elif wind <= 40:
-            score -= 2
-            negatives.append("Wind may make casting harder.")
-        else:
-            score -= 10
-            negatives.append("Strong wind may be difficult or unsafe.")
-
+        if wind <= 25: score += 8; pos.append("Wind appears fishable.")
+        elif wind <= 40: score -= 2; neg.append("Wind may affect casting.")
+        else: score -= 10; neg.append("Strong wind may be difficult or unsafe.")
     if wave is not None:
-        if 0.7 <= wave <= 1.8:
-            score += 10
-            positives.append("Swell height may create working water.")
-        elif wave < 0.7:
-            score -= 3
-            negatives.append("Sea may be too flat.")
-        else:
-            score -= 8
-            negatives.append("Swell may be rough; check safety.")
-
+        if 0.7 <= wave <= 1.8: score += 10; pos.append("Swell may create working water.")
+        elif wave < 0.7: score -= 3; neg.append("Sea may be too flat.")
+        else: score -= 8; neg.append("Swell may be rough; verify safety.")
     if period is not None:
-        if 8 <= period <= 14:
-            score += 5
-            positives.append("Wave period supports structured surf movement.")
-        elif period > 16:
-            score -= 4
-            negatives.append("Long-period swell can create powerful sets.")
+        if 8 <= period <= 14: score += 5; pos.append("Wave period supports structured surf movement.")
+        elif period > 16: score -= 4; neg.append("Long-period swell can create powerful sets.")
+    if rain is not None and rain >= 70: score -= 5; neg.append("High rain probability may reduce comfort.")
+    if species in SPECIES and bucket in SPECIES[species]["time_bonus"]: score += 6; pos.append(f"Time bucket suits {species}.")
+    return max(0, min(95, score)), pos, neg
 
-    if rain is not None and rain >= 70:
-        score -= 5
-        negatives.append("High rain probability may reduce comfort and visibility.")
+def correct_target_by_bait(preferred_target, likely_species, available_baits):
+    if preferred_target == "Auto select":
+        candidates = likely_species or list(SPECIES.keys())
+    else:
+        candidates = [preferred_target]
+    if preferred_target != "Auto select" and preferred_target in SPECIES:
+        status, matched, _ = bait_match_engine(available_baits, SPECIES[preferred_target]["ideal_baits"])
+        if status == "Good match" or not available_baits:
+            return preferred_target, None
+    scored = []
+    for fish in (likely_species or list(SPECIES.keys())):
+        if fish not in SPECIES: continue
+        status, matched, _ = bait_match_engine(available_baits, SPECIES[fish]["ideal_baits"])
+        s = 50 + len(matched)*12 + (8 if status == "Good match" else 0)
+        scored.append((fish, s, matched))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    suggestion = scored[0][0] if scored else (preferred_target if preferred_target != "Auto select" else "Kob")
+    if preferred_target != "Auto select" and suggestion != preferred_target and available_baits:
+        return suggestion, f"You selected {preferred_target}, but your bait ({', '.join(available_baits)}) is not aligned to it. Suggested target: {suggestion}."
+    return suggestion, None
 
-    if selected_species == "Kob" and time_bucket in ["Evening", "Night", "Early Morning"]:
-        score += 6
-        positives.append("Time bucket suits Kob behaviour.")
+def score_spot(name, spot, origin, time_bucket, available_baits, preferred_target, conditions=None, tide_stage="Estimated tide unknown"):
+    d = geodesic(origin, spot["stand"]).km
+    base = spot.get("confidence", 65)
+    if spot.get("feature_type") in ["gully", "river mouth", "white water", "rock"]: base += 8
+    likely = spot.get("species", [])
+    target, correction = correct_target_by_bait(preferred_target, likely, available_baits)
+    if target in likely: base += 7
+    if target in SPECIES and time_bucket in SPECIES[target]["time_bonus"]: base += 7
+    status, matched, _ = bait_match_engine(available_baits, SPECIES.get(target, SPECIES["Kob"])["ideal_baits"])
+    if status == "Good match": base += 9
+    elif status == "Poor match": base -= 8
+    if d <= 5: base += 5
+    elif d <= 10: base += 3
+    elif d <= 20: base += 1
+    return max(15, min(95, int(base))), target, correction
 
-    if selected_species == "Shad" and time_bucket in ["Early Morning", "Morning", "Afternoon"]:
-        score += 5
-        positives.append("Time bucket suits Shad activity.")
-
-    if selected_species == "Garrick" and time_bucket in ["Morning", "Afternoon"]:
-        score += 5
-        positives.append("Time bucket suits Garrick movement.")
-
-    return max(0, min(95, score)), positives, negatives
-
-
-# =====================================================
-# MICRO-SPOT DATABASE
-# More specific than area names.
-# =====================================================
-
-fishing_spots = {
-    "Leisure Bay Main Beach Gully": {
-        "area": "Leisure Bay",
-        "stand": (-30.823900, 30.406200),
-        "cast": (-30.824250, 30.406650),
-        "structure": "Dark sand gully with white-water edge",
-        "feature_type": "gully",
-        "depth_note": "Estimated deeper gully between shallow sandbanks",
-        "confidence": 78,
-        "species": ["Kob", "Shad", "Bronze Bream", "Blacktail", "Stone Bream", "Sand Shark", "Grey Shark", "Diamond Ray"],
-        "notes": "Good beach structure. Fish the edge where white water meets darker channel.",
-    },
-    "Trafalgar Rock-Sand Transition": {
-        "area": "Trafalgar",
-        "stand": (-30.833900, 30.410500),
-        "cast": (-30.834300, 30.411050),
-        "structure": "Rock and sand transition with feeding gully",
-        "feature_type": "gully",
-        "depth_note": "Medium-depth gully near rock/sand transition",
-        "confidence": 82,
-        "species": ["Kob", "Shad", "Bronze Bream", "Blacktail", "Stone Bream", "Grey Shark", "Honeycomb Ray", "Diamond Ray"],
-        "notes": "Strong structure option. Target the gully edge, not the middle.",
-    },
-    "Palm Beach White-Water Channel": {
-        "area": "Palm Beach",
-        "stand": (-30.867000, 30.382300),
-        "cast": (-30.867420, 30.382850),
-        "structure": "Working white water with channel edge",
-        "feature_type": "white water",
-        "depth_note": "Working white water over sandbank edge",
-        "confidence": 74,
-        "species": ["Shad", "Kob", "Garrick", "Bronze Bream", "Blacktail", "Pompano", "Grey Shark"],
-        "notes": "Good if water is working. Better for Shad when there is visible white water.",
-    },
-    "Southbroom River-Mouth Channel": {
-        "area": "Southbroom",
-        "stand": (-30.919200, 30.328700),
-        "cast": (-30.919650, 30.329300),
-        "structure": "River-mouth influence with deeper channel",
-        "feature_type": "river mouth",
-        "depth_note": "Channel edge influenced by river-mouth water movement",
-        "confidence": 76,
-        "species": ["Kob", "Garrick", "Grunter", "Pompano", "Shad", "Sand Shark", "Grey Shark"],
-        "notes": "Better around moving tide. Fish the channel and current seam.",
-    },
-
-    # Umhlanga micro-spots
-    "Umhlanga Lighthouse Gully": {
-        "area": "Umhlanga Lighthouse",
-        "stand": (-29.717820, 31.089420),
-        "cast": (-29.718050, 31.089880),
-        "structure": "Deep gully near lighthouse rocks",
-        "feature_type": "gully",
-        "depth_note": "Rocky gully / deeper channel close to ledge",
-        "confidence": 80,
-        "species": ["Kob", "Garrick", "Shad", "Blacktail", "Bronze Bream", "Kingfish", "Rockcod"],
-        "notes": "Fish the gully edge, not the flat water. Use caution on rocks.",
-    },
-    "Umhlanga Lagoon Mouth Current Seam": {
-        "area": "Umhlanga Lagoon Mouth",
-        "stand": (-29.720500, 31.088000),
-        "cast": (-29.720900, 31.088600),
-        "structure": "River mouth current seam and sandbank edge",
-        "feature_type": "river mouth",
-        "depth_note": "Moving water where lagoon flow meets surf line",
-        "confidence": 82,
-        "species": ["Garrick", "Kob", "Grunter", "Shad", "Pompano"],
-        "notes": "Best around pushing or outgoing tide. Look for baitfish and current movement.",
-    },
-    "Bronze Beach Gully Section": {
-        "area": "Bronze Beach",
-        "stand": (-29.713900, 31.092000),
-        "cast": (-29.714300, 31.092500),
-        "structure": "Sandbank drop-off with working white water",
-        "feature_type": "white water",
-        "depth_note": "White-water edge over channel / sandbank drop",
-        "confidence": 76,
-        "species": ["Shad", "Kob", "Garrick", "Pompano", "Grey Shark"],
-        "notes": "Good for Shad when white water is active. Cast into the working edge, not dead water.",
-    },
-}
-# =====================================================
-# SAFETY RATINGS
-# =====================================================
-
-safety_ratings = {
-    "Leisure Bay Main Beach Gully": {
-        "risk": "Medium",
-        "advice": "Avoid isolated fishing at night. Prefer daylight or fish with others. Keep valuables out of sight.",
-    },
-    "Trafalgar Rock-Sand Transition": {
-        "risk": "Medium",
-        "advice": "Use known access points. Avoid leaving valuables visible in your vehicle. Be cautious early morning and night.",
-    },
-    "Palm Beach White-Water Channel": {
-        "risk": "Medium",
-        "advice": "Be cautious around quiet beach access points, especially early morning or night.",
-    },
-    "Southbroom River-Mouth Channel": {
-        "risk": "Low to Medium",
-        "advice": "Generally safer around active areas, but avoid isolated night fishing alone. Park in visible areas.",
-    },
-    "Umhlanga Lighthouse Gully": {
-        "risk": "Medium",
-        "advice": "Busy area but rock fishing can be risky. Avoid isolated rocks at night and watch for vehicle break-ins.",
-    },
-    "Umhlanga Lagoon Mouth Current Seam": {
-        "risk": "Medium",
-        "advice": "Be cautious around quiet access points. Avoid night fishing alone. Check lagoon/MPA restrictions.",
-    },
-    "Bronze Beach Gully Section": {
-        "risk": "Medium",
-        "advice": "Popular beach area, but still protect valuables and avoid isolated sections at night.",
-    },
-}
+def build_candidate_spots(origin, radius_km):
+    candidates = []
+    for name, spot in FISHING_SPOTS.items():
+        d = geodesic(origin, spot["stand"]).km
+        if d <= radius_km:
+            candidates.append((name, spot.copy(), d, "Seeded spot"))
+    osm_spots = fetch_osm_beach_spots(origin[0], origin[1], int(radius_km*1000))
+    for o in osm_spots:
+        name = f"{o['name']} (OSM coastal option)"
+        d = geodesic(origin, (o["lat"], o["lon"])).km
+        feature = "river mouth" if "waterway" in o.get("tags", {}) else "beach"
+        species = ["Kob", "Shad", "Garrick", "Pompano", "Blacktail", "Spotted Grunter"] if feature == "beach" else ["Kob", "Spotted Grunter", "Garrick", "Shad"]
+        candidates.append((name, {"area": o["name"], "stand": (o["lat"], o["lon"]), "feature_type": feature, "structure": "OpenStreetMap coastal feature near selected location", "confidence": 66, "species": species, "notes": "Dynamically found coastal feature. Confirm access and safety locally."}, d, "Dynamic OSM"))
+    if not candidates:
+        snap = coastline_snap_engine(origin)
+        candidates.append(("Nearest coastline generated spot", {"area": "Nearest coastline", "stand": snap["coast"], "feature_type": "coastline", "structure": "Generated nearest coastline point", "confidence": 60, "species": ["Kob", "Shad", "Garrick", "Blacktail", "Pompano"], "notes": "Generated because no named spot was found within the radius."}, geodesic(origin, snap["coast"]).km, "Generated"))
+    return candidates
 
 # =====================================================
-# SPECIES ENGINE
+# Sidebar
 # =====================================================
-
-species_engine = {
-    "Kob": {
-        "ideal_baits": ["Chokka", "Sardine", "Mackerel", "Live mullet", "Fish fillet"],
-        "time_bonus": ["Early Morning", "Evening", "Night", "Midnight"],
-        "thinking": "Kob prefer deeper gullies, holes and slower water near the bottom.",
-        "bait": "Chokka + sardine combo, mackerel fillet, live bait where legal.",
-        "trace": "Sliding sinker trace",
-        "leader": "0.55mm to 0.70mm nylon leader",
-        "hooks": "2 x 5/0 to 7/0 hooks, or circle hooks",
-        "sinker": "5oz to 6oz grapnel sinker",
-        "technique": "Cast into the deep channel. Let bait settle. Slow drag every 30–60 seconds.",
-        "bite_style": "Soft pickup → suction feed → slow run",
-        "feel": "Light taps, rod slowly loads, fish may feel like dead weight first.",
-        "response": "Do not strike immediately. Let the rod load, then lift firmly.",
-        "mistake": "Striking too early.",
-        "trace_image": "images/kob_trace.png",
-        "bait_image": "images/chokka_sardine_combo_bait.png",
-        "trace_diagram": "Main Line\n|\nRunning sinker clip ---- 5oz grapnel\n|\nSwivel\n|\nLeader\n|\nHook 5/0\n|\nHook 5/0",
-    },
-    "Shad": {
-        "ideal_baits": ["Sardine", "Chokka", "Spoon lure"],
-        "time_bonus": ["Early Morning", "Morning", "Afternoon", "Evening"],
-        "thinking": "Shad are aggressive feeders that like white water and moving bait.",
-        "bait": "Sardine, chokka strip, spoon lure.",
-        "trace": "Short steel trace",
-        "leader": "Light steel trace with 0.45mm nylon leader",
-        "hooks": "1/0 to 3/0 hooks",
-        "sinker": "2oz to 4oz sinker depending on surf",
-        "technique": "Cast into working white water. Keep bait moving. Retrieve actively.",
-        "bite_style": "Fast repeated hits → aggressive attack",
-        "feel": "Multiple sharp knocks, fast tapping, bait stripped quickly.",
-        "response": "Strike quickly and keep pressure.",
-        "mistake": "Leaving bait too static.",
-        "trace_image": "images/shad_trace.png",
-        "bait_image": "images/sardine_bait.png",
-        "trace_diagram": "Main Line\n|\nSwivel\n|\nShort steel trace\n|\n1/0 - 3/0 hook\n|\nSardine / spoon / chokka strip",
-    },
-    "Garrick": {
-        "ideal_baits": ["Live mullet", "Paddle tail lure", "Spoon lure"],
-        "time_bonus": ["Morning", "Afternoon"],
-        "thinking": "Garrick hunt moving bait in current seams, river mouths and channel edges.",
-        "bait": "Live mullet, paddle tail lure, spoon lure.",
-        "trace": "Live bait trace / light steel leader",
-        "leader": "0.60mm nylon or light steel bite trace",
-        "hooks": "Single 6/0 to 8/0 circle hook",
-        "sinker": "Minimal weight or free-swim live bait",
-        "technique": "Work live bait naturally along the current seam.",
-        "bite_style": "Aggressive grab → fast run",
-        "feel": "Sharp pull, line runs quickly, rod tip dips hard.",
-        "response": "Keep rod tip up. Let circle hook set under pressure.",
-        "mistake": "Striking too hard too early.",
-        "trace_image": "images/garrick_trace.png",
-        "bait_image": "images/live_mullet_bait.png",
-        "trace_diagram": "Main Line\n|\nSwivel\n|\nLeader / light steel\n|\nSingle 6/0 - 8/0 circle hook\n|\nLive mullet",
-    },
-    "Bronze Bream": {
-        "ideal_baits": ["Prawn", "Red bait", "Mussel", "Crayfish"],
-        "time_bonus": ["Morning", "Afternoon"],
-        "thinking": "Bronze Bream hold close to rocks, reef edges and foamy water.",
-        "bait": "Prawn, red bait, mussel, crayfish where legal.",
-        "trace": "Short scratching trace",
-        "leader": "0.40mm to 0.55mm leader",
-        "hooks": "1/0 to 3/0 strong hooks",
-        "sinker": "2oz to 4oz sinker",
-        "technique": "Fish closer in around rocks and foamy pockets. Do not overcast.",
-        "bite_style": "Small taps → firm pull",
-        "feel": "Small pecks, short sharp pulls, then strong movement into rocks.",
-        "response": "Lift firmly once committed and keep pressure.",
-        "mistake": "Fishing too far out.",
-        "trace_image": "images/bronze_bream_trace.png",
-        "bait_image": "images/prawn_bait.png",
-        "trace_diagram": "Main Line\n|\nSwivel\n|\nShort leader\n|\nSmall strong hook\n|\nPrawn / red bait / mussel",
-    },
-    "Blacktail": {
-        "ideal_baits": ["Prawn", "Sardine", "Mussel", "Red bait"],
-        "time_bonus": ["Morning", "Afternoon"],
-        "thinking": "Blacktail feed close to rocks, gullies and foam pockets.",
-        "bait": "Prawn, sardine pieces, mussel, red bait.",
-        "trace": "Light scratching trace",
-        "leader": "0.35mm to 0.45mm leader",
-        "hooks": "Size 1 to 1/0 hooks",
-        "sinker": "1oz to 3oz sinker",
-        "technique": "Fish close-in around rocks and small gullies.",
-        "bite_style": "Quick pecks → committed pull",
-        "feel": "Rapid taps and short pulls.",
-        "response": "Wait for a committed pull, then lift.",
-        "mistake": "Using bait that is too large.",
-        "trace_image": "images/blacktail_trace.png",
-        "bait_image": "images/prawn_bait.png",
-        "trace_diagram": "Main Line\n|\nSmall sinker\n|\nSwivel\n|\nLight leader\n|\nSmall hook",
-    },
-    "Grunter": {
-        "ideal_baits": ["Prawn", "Cracker shrimp", "Worm"],
-        "time_bonus": ["Evening", "Night"],
-        "thinking": "Grunter feed over sandbanks, estuary edges and shallow channels.",
-        "bait": "Prawn, cracker shrimp, worm.",
-        "trace": "Light running trace",
-        "leader": "0.35mm to 0.45mm leader",
-        "hooks": "1/0 to 2/0 hooks",
-        "sinker": "Light sinker only",
-        "technique": "Present bait naturally. Avoid heavy tackle.",
-        "bite_style": "Gentle pull → slow movement",
-        "feel": "Line tightens slowly, fish may drop bait if resistance is high.",
-        "response": "Let fish move with bait, then lift smoothly.",
-        "mistake": "Using tackle that is too heavy.",
-        "trace_image": "images/grunter_trace.png",
-        "bait_image": "images/prawn_bait.png",
-        "trace_diagram": "Main Line\n|\nSmall running sinker\n|\nSwivel\n|\nLight leader\n|\n1/0 - 2/0 hook",
-    },
-    "Pompano": {
-        "ideal_baits": ["Prawn", "Worm", "Small crab"],
-        "time_bonus": ["Morning", "Afternoon"],
-        "thinking": "Pompano feed in sandy channels and clean water near banks.",
-        "bait": "Prawn, worm, small crab.",
-        "trace": "Light running trace",
-        "leader": "0.35mm to 0.50mm leader",
-        "hooks": "1/0 to 3/0 hooks",
-        "sinker": "2oz to 4oz sinker",
-        "technique": "Cast to sandbank edges and allow bait to move naturally.",
-        "bite_style": "Fast pickup → strong run",
-        "feel": "Sharp pull then speed.",
-        "response": "Lift smoothly and maintain pressure.",
-        "mistake": "Too much heavy tackle.",
-        "trace_image": "images/pompano_trace.png",
-        "bait_image": "images/prawn_bait.png",
-        "trace_diagram": "Main Line\n|\nRunning sinker\n|\nSwivel\n|\nLight leader\n|\nPrawn / worm bait",
-    },
-    "Sand Shark": {
-        "ideal_baits": ["Sardine", "Mackerel", "Chokka", "Fish head"],
-        "time_bonus": ["Evening", "Night", "Midnight"],
-        "thinking": "Sand sharks feed in sandy channels and gullies.",
-        "bait": "Sardine, mackerel, chokka, fish head.",
-        "trace": "Strong non-edible trace",
-        "leader": "Heavy nylon / steel depending on size",
-        "hooks": "6/0 to 10/0 hooks",
-        "sinker": "5oz to 8oz grapnel",
-        "technique": "Cast into deeper channel and wait for steady run.",
-        "bite_style": "Slow pickup → steady pull",
-        "feel": "Rod loads and line pulls steadily.",
-        "response": "Let pressure build, then set hook firmly.",
-        "mistake": "Fishing too light.",
-        "trace_image": "images/sand_shark_trace.png",
-        "bait_image": "images/sardine_bait.png",
-        "trace_diagram": "Main Line\n|\nHeavy leader\n|\nSinker clip\n|\nLarge hook bait",
-    },
-    "Grey Shark": {
-        "ideal_baits": ["Sardine", "Mackerel", "Bonito", "Chokka"],
-        "time_bonus": ["Evening", "Night", "Midnight"],
-        "thinking": "Grey sharks patrol gullies, banks and channels.",
-        "bait": "Sardine, mackerel, bonito, chokka.",
-        "trace": "Steel or heavy shark trace",
-        "leader": "Heavy leader with steel bite section",
-        "hooks": "6/0 to 10/0 hooks",
-        "sinker": "6oz to 8oz grapnel",
-        "technique": "Fish deeper channels with solid bait presentation.",
-        "bite_style": "Pickup → fast sustained run",
-        "feel": "Line peels off steadily.",
-        "response": "Let it run briefly, then apply pressure.",
-        "mistake": "Weak bite trace.",
-        "trace_image": "images/grey_shark_trace.png",
-        "bait_image": "images/sardine_bait.png",
-        "trace_diagram": "Main Line\n|\nHeavy leader\n|\nSteel bite trace\n|\nLarge hook",
-    },
-    "Diamond Ray": {
-        "ideal_baits": ["Chokka", "Sardine", "Mackerel", "Octopus"],
-        "time_bonus": ["Evening", "Night", "Midnight"],
-        "thinking": "Diamond rays feed over sand and channel edges.",
-        "bait": "Chokka, sardine, mackerel, octopus.",
-        "trace": "Heavy sliding trace",
-        "leader": "Heavy nylon leader",
-        "hooks": "8/0 to 10/0 hooks",
-        "sinker": "6oz to 8oz grapnel",
-        "technique": "Fish sandy deeper channels. Expect heavy slow fight.",
-        "bite_style": "Weighty pickup → heavy pull",
-        "feel": "Dead weight followed by strong movement.",
-        "response": "Apply steady pressure. Do not rush.",
-        "mistake": "Trying to bully the fish too quickly.",
-        "trace_image": "images/diamond_ray_trace.png",
-        "bait_image": "images/sardine_bait.png",
-        "trace_diagram": "Main Line\n|\nHeavy sinker clip\n|\nSwivel\n|\nHeavy leader\n|\nLarge hook bait",
-    },
-    "Honeycomb Ray": {
-        "ideal_baits": ["Octopus", "Chokka", "Mackerel", "Sardine"],
-        "time_bonus": ["Evening", "Night", "Midnight"],
-        "thinking": "Honeycomb rays favour sandy gullies and deeper banks.",
-        "bait": "Octopus, chokka, mackerel, sardine.",
-        "trace": "Heavy ray trace",
-        "leader": "Heavy nylon leader",
-        "hooks": "8/0 to 12/0 hooks",
-        "sinker": "6oz to 8oz grapnel",
-        "technique": "Place bait in deeper channel and prepare for long fight.",
-        "bite_style": "Slow pickup → very heavy pull",
-        "feel": "Strong weight and slow powerful movement.",
-        "response": "Keep steady pressure and manage drag.",
-        "mistake": "Underestimating fight time.",
-        "trace_image": "images/honeycomb_ray_trace.png",
-        "bait_image": "images/octopus_bait.png",
-        "trace_diagram": "Main Line\n|\nHeavy leader\n|\nLarge hook\n|\nLarge bait",
-    },
-}
-
-# Ensure all fish in spot database have species info
-for fish_name in sorted({fish for s in fishing_spots.values() for fish in s["species"]}):
-    if fish_name not in species_engine:
-        base = species_engine["Kob"]
-        species_engine[fish_name] = base.copy()
-        species_engine[fish_name]["thinking"] = f"{fish_name} uses prototype rules. Refine with local species data."
-        species_engine[fish_name]["trace_image"] = f"images/{fish_name.lower().replace(' ', '_')}_trace.png"
-
-# =====================================================
-# REGULATION ENGINE - MOCKUP / PROTOTYPE
-# =====================================================
-
-regulation_data = {
-    "Blacktail": {"bag": "5", "min_size": "20 cm", "closed": "Open", "protected": "No", "mpa": "Check selected area", "feedback": "Warn if >5 or undersize"},
-    "Bronze Bream": {"bag": "2", "min_size": "30 cm", "closed": "Open", "protected": "No", "mpa": "Check selected area", "feedback": "Warn if >2 or undersize"},
-    "Garrick": {"bag": "2", "min_size": "70 cm", "closed": "Verify current season", "protected": "No", "mpa": "Check selected area", "feedback": "Warn limits"},
-    "Grunter": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "No", "mpa": "Check selected area", "feedback": "Ask user to confirm"},
-    "Kob": {"bag": "Varies", "min_size": "Varies by area/method", "closed": "Verify local rules", "protected": "No", "mpa": "Check selected area", "feedback": "Ask shore/estuary/boat"},
-    "Pompano": {"bag": "Verify", "min_size": "Verify", "closed": "Verify", "protected": "No", "mpa": "Check selected area", "feedback": "Log size/quantity"},
-    "Shad": {"bag": "4", "min_size": "30 cm", "closed": "Seasonal closure applies", "protected": "No", "mpa": "Check selected area", "feedback": "Block keep in closure"},
-}
-
-regulation_table = pd.DataFrame([
-    {
-        "Fish": fish,
-        "Bag Limit": data["bag"],
-        "Minimum Size": data["min_size"],
-        "Closed Season": data["closed"],
-        "Protected": data["protected"],
-        "MPA Check": data["mpa"],
-        "Feedback Rule": data["feedback"],
-    }
-    for fish, data in sorted(regulation_data.items())
-])
-
-# =====================================================
-# MAIN INPUTS - SIDEBAR
-# =====================================================
+st.sidebar.header("🔌 API Status")
+with st.sidebar.expander("API lock status", expanded=False):
+    for api_name, api_status in api_key_status().items():
+        st.write(f"**{api_name}:** {api_status}")
+    st.caption("Keys can be set in .streamlit/secrets.toml or Windows environment variables. App will not crash if keys are missing.")
 
 st.sidebar.header("📍 Location")
+loc_method = st.sidebar.radio("Choose location method", ["Search any South African location", "Use current GPS", "Choose example area", "Enter coordinates"])
 
-location_method = st.sidebar.radio(
-    "Choose location method",
-    ["Use current Location", "Enter coordinates", "Choose planning area"]
-)
+if "selected_location" not in st.session_state:
+    st.session_state.selected_location = AREA_LOCATIONS["Umhlanga"]
+    st.session_state.location_basis = "Default: Umhlanga"
 
-location_basis = "Unknown"
-
-if location_method == "Use current GPS":
-    location = streamlit_geolocation()
-
-    if location and location.get("latitude") is not None:
-        user_location = (location["latitude"], location["longitude"])
-        location_basis = "Current GPS location"
-        st.sidebar.success(f"GPS found: {user_location[0]:.6f}, {user_location[1]:.6f}")
+if loc_method == "Search any South African location":
+    query = st.sidebar.text_input("Search location", value="Umhlanga", placeholder="e.g. Umhlanga, Ballito, Port Edward")
+    if st.sidebar.button("🔎 Search location"):
+        g = geocode_sa_location(query)
+        if g:
+            st.session_state.selected_location = (g["lat"], g["lon"])
+            st.session_state.location_basis = f"Search: {g['display_name']}"
+        else:
+            st.sidebar.error("Location not found. Try a nearby town/beach name.")
+elif loc_method == "Use current GPS":
+    if streamlit_geolocation:
+        loc = streamlit_geolocation()
+        if loc and loc.get("latitude") is not None:
+            st.session_state.selected_location = (loc["latitude"], loc["longitude"])
+            st.session_state.location_basis = "Current GPS location"
     else:
-        user_location = (-30.823900, 30.406200)
-        location_basis = "Fallback: Leisure Bay sample"
-        st.sidebar.warning("GPS not available. Using Leisure Bay sample.")
-
-elif location_method == "Enter coordinates":
-    manual_lat = st.sidebar.number_input("Latitude", value=-30.823900, format="%.6f")
-    manual_lon = st.sidebar.number_input("Longitude", value=30.406200, format="%.6f")
-    user_location = (manual_lat, manual_lon)
-    location_basis = f"Entered coordinates: {manual_lat:.6f}, {manual_lon:.6f}"
-    st.sidebar.success(location_basis)
-
+        st.sidebar.warning("streamlit-geolocation not installed. Using fallback.")
+    if st.sidebar.button("📍 Refresh GPS"):
+        st.rerun()
+elif loc_method == "Choose example area":
+    area = st.sidebar.selectbox("Example area", list(AREA_LOCATIONS.keys()))
+    st.session_state.selected_location = AREA_LOCATIONS[area]
+    st.session_state.location_basis = f"Example area: {area}"
 else:
-    selected_area = st.sidebar.selectbox(
-        "Where will you be fishing from?",
-        list(area_locations.keys())
-    )
-    user_location = area_locations[selected_area]
-    location_basis = f"Planning from: {selected_area}"
-    st.sidebar.success(location_basis)
+    lat = st.sidebar.number_input("Latitude", value=st.session_state.selected_location[0], format="%.6f")
+    lon = st.sidebar.number_input("Longitude", value=st.session_state.selected_location[1], format="%.6f")
+    st.session_state.selected_location = (lat, lon)
+    st.session_state.location_basis = f"Entered coordinates: {lat:.6f}, {lon:.6f}"
+
+user_location = st.session_state.selected_location
+location_basis = st.session_state.location_basis
 
 st.sidebar.header("🎯 Trip Setup")
+trip_date = st.sidebar.date_input("Fishing date", value=datetime.today().date())
+time_bucket = st.sidebar.selectbox("Preferred fishing time", options=list(TIME_BUCKET_WINDOWS.keys()), format_func=lambda x: f"{x} ({TIME_BUCKET_WINDOWS[x]})")
+max_travel_km = st.sidebar.selectbox("How far are you willing to travel?", [2, 5, 10, 20, 50, 100], index=2)
+casting_ability = st.sidebar.selectbox("Casting ability", ["Beginner: 20–40m", "Average: 40–70m", "Strong caster: 70–110m", "Advanced: 110m+"], index=1)
+preferred_target = st.sidebar.selectbox("Preferred target species", ["Auto select"] + sorted(SPECIES.keys()))
+available_baits = st.sidebar.multiselect("Bait you have available", ALL_BAITS, max_selections=10)
 
-trip_date = st.sidebar.date_input("Fishing date", value=datetime.today())
-
-time_bucket = st.sidebar.selectbox("Preferred fishing time", list(time_bucket_windows.keys()))
-
-tide_stage = st.sidebar.selectbox(
-    "Tide stage",
-    ["Pushing tide", "Outgoing tide", "High tide turning", "Low tide turning", "Slack / not sure"]
-)
-
-max_travel_km = st.sidebar.selectbox(
-    "How far are you willing to travel?",
-    [2, 5, 10, 20, 50, 100],
-    index=2
-)
-
-casting_ability = st.sidebar.selectbox(
-    "Casting ability",
-    ["Beginner: 20–40m", "Average: 40–70m", "Strong caster: 70–110m", "Advanced: 110m+"],
-    index=1
-)
-
-preferred_target = st.sidebar.selectbox(
-    "Preferred target species",
-    ["Auto select"] + list(species_engine.keys())
-)
-
-available_baits = st.sidebar.multiselect(
-    "Bait you have available - select up to 10",
-    all_baits,
-    max_selections=10
-)
+with st.sidebar.expander("⚙️ Advanced settings", expanded=False):
+    inland_m = st.slider("Stand safety distance inland from coastline", 20, 150, 55, 5)
+    cast_m = st.slider("Cast target distance seaward from coastline", 30, 180, 85, 5)
+    manual_tide_override = st.selectbox("Manual tide override", ["Auto", "Pushing tide", "Outgoing tide", "High tide turning", "Low tide turning", "Slack / not sure"])
+    st.caption("Manual tide override is hidden here because normal users should not need to guess tides.")
 
 # =====================================================
-# RECOMMENDATION ENGINE
+# Recommendation calculation
 # =====================================================
+raw_candidates = build_candidate_spots(user_location, max_travel_km)
+ranked_rows = []
+for name, spot, dist, source in raw_candidates:
+    conf, target, correction = score_spot(name, spot, user_location, time_bucket, available_baits, preferred_target)
+    ranked_rows.append({"Spot": name, "Area": spot.get("area", ""), "Distance km": round(dist, 2), "Fishing confidence": conf, "Confidence range": confidence_label(conf), "Suggested target": target, "Structure": spot.get("structure", ""), "Source": source, "_spot": spot, "_correction": correction})
+ranked_rows.sort(key=lambda r: r["Fishing confidence"], reverse=True)
 
-closest_name = None
-closest_distance = float("inf")
+spot_labels = [f"{r['Spot']} — {r['Fishing confidence']}% ({r['Confidence range']})" for r in ranked_rows]
+if "selected_spot_label" not in st.session_state or st.session_state.selected_spot_label not in spot_labels:
+    st.session_state.selected_spot_label = spot_labels[0]
 
-for name, spot_data in fishing_spots.items():
-    dist_km = geodesic(user_location, spot_data["stand"]).km
+# Main tabs
+tabs = st.tabs(["🏠 Home", "🎯 Recommendation", "🛰️ Map", "🎣 Bait & Trace", "🌊 Conditions", "🛡️ Safety", "📏 Regulations", "💎 Packages", "📘 Guide", "❓ FAQ"])
 
-    if dist_km < closest_distance:
-        closest_distance = dist_km
-        closest_name = name
+# Choice appears in recommendation tab too, but calculation uses session state.
+selected_idx = max(0, spot_labels.index(st.session_state.selected_spot_label) if st.session_state.selected_spot_label in spot_labels else 0)
+selected_row = ranked_rows[selected_idx]
+best_name = selected_row["Spot"]
+spot = selected_row["_spot"]
+selected_species, bait_correction_msg = selected_row["Suggested target"], selected_row["_correction"]
 
-candidates = []
-
-for name, spot_data in fishing_spots.items():
-    dist_km = geodesic(user_location, spot_data["stand"]).km
-
-    if dist_km <= max_travel_km:
-        score = spot_data["confidence"]
-
-        # Structure score
-        if spot_data["feature_type"] in ["gully", "river mouth", "white water"]:
-            score += 8
-
-        # Time advantage
-        for fish in spot_data["species"]:
-            if fish in species_engine and time_bucket in species_engine[fish]["time_bonus"]:
-                score += 4
-
-        # Bait advantage
-        for fish in spot_data["species"]:
-            if fish in species_engine:
-                bait_status_temp, _, _ = bait_match_engine(
-                    available_baits,
-                    species_engine[fish]["ideal_baits"]
-                )
-                if bait_status_temp == "Good match":
-                    score += 4
-
-        # Distance practicality
-        if dist_km <= 5:
-            score += 5
-        elif dist_km <= 10:
-            score += 3
-        elif dist_km <= 20:
-            score += 1
-
-        candidates.append((name, dist_km, score))
-
-if not candidates:
-    st.warning("No fishing spots found within your selected radius. Showing closest available spot instead.")
-    candidates.append((closest_name, closest_distance, fishing_spots[closest_name]["confidence"]))
-
-candidates.sort(key=lambda x: x[2], reverse=True)
-
-best_spot_name = candidates[0][0]
-best_distance = candidates[0][1]
-best_review_score = candidates[0][2]
-
-spot = fishing_spots[best_spot_name]
-stand = spot["stand"]
-cast = spot["cast"]
-
+snap = coastline_snap_engine(spot["stand"], inland_m=inland_m, cast_m=cast_m)
+stand, cast = snap["stand"], snap["cast"]
 cast_distance = geodesic(stand, cast).meters
 bearing = calculate_bearing(stand, cast)
 compass = bearing_to_compass(bearing)
-
-likely_species = spot["species"]
-
-if preferred_target == "Auto select":
-    ranked = []
-
-    for fish in likely_species:
-        if fish not in species_engine:
-            continue
-
-        score = 50
-
-        if time_bucket in species_engine[fish]["time_bonus"]:
-            score += 12
-
-        bait_status_temp, _, _ = bait_match_engine(
-            available_baits,
-            species_engine[fish]["ideal_baits"]
-        )
-
-        if bait_status_temp == "Good match":
-            score += 10
-        elif bait_status_temp == "Poor match":
-            score -= 8
-
-        ranked.append((fish, score))
-
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    selected_species = ranked[0][0]
-else:
-    selected_species = preferred_target
-
-species = species_engine[selected_species]
-
-bait_status, matched_baits, bait_message = bait_match_engine(
-    available_baits,
-    species["ideal_baits"]
-)
-
-alternative_targets = []
-
-for fish in likely_species:
-    if fish in species_engine:
-        alt_status, _, _ = bait_match_engine(
-            available_baits,
-            species_engine[fish]["ideal_baits"]
-        )
-        if alt_status == "Good match" and fish != selected_species:
-            alternative_targets.append(fish)
-
-conditions = fetch_conditions(stand[0], stand[1], trip_date, time_bucket)
+conditions = fetch_conditions(stand[0], stand[1], trip_date.strftime("%Y-%m-%d"), time_bucket)
+tide_data = get_tide_data(stand[0], stand[1], trip_date, time_bucket, manual_tide_override)
+tide_stage = tide_data["stage"] or "Estimated tide unknown"
 moon_phase = moon_phase_name(trip_date)
-
-condition_score, cond_pos, cond_neg = condition_score_engine(
-    conditions,
-    tide_stage,
-    moon_phase,
-    selected_species,
-    time_bucket
-)
-
-confidence = spot["confidence"]
-
-if selected_species in likely_species:
-    confidence += 5
-else:
-    confidence -= 8
-
-if time_bucket in species["time_bonus"]:
-    confidence += 8
-    time_reason = f"{selected_species} is favoured during {time_bucket}."
-else:
-    confidence -= 3
-    time_reason = f"{time_bucket} is not the strongest time for {selected_species}."
-
-if bait_status == "Good match":
-    confidence += 5
-elif bait_status == "Poor match":
-    confidence -= 10
-
-confidence = int((confidence * 0.65) + (condition_score * 0.35))
+condition_score, cond_pos, cond_neg = condition_score_engine(conditions, tide_stage, moon_phase, selected_species, time_bucket)
+species = SPECIES[selected_species]
+bait_status, matched_baits, bait_message = bait_match_engine(available_baits, species["ideal_baits"])
+confidence = int(selected_row["Fishing confidence"] * 0.65 + condition_score * 0.35)
 confidence = max(0, min(95, confidence))
 
-# Bait image logic: prefer bait user has, then fallback to species ideal image
-matched_bait_image = None
-matched_bait_name = None
-
-for bait in available_baits:
-    if bait in species["ideal_baits"]:
-        matched_bait_image = bait_image_lookup.get(bait)
-        matched_bait_name = bait
-        break
-
-if matched_bait_image:
-    bait_image_path = matched_bait_image
-    bait_image_caption = f"Use your available bait: {matched_bait_name}"
-else:
-    bait_image_name = species.get("bait_image", "").split("/")[-1]
-    bait_image_path = f"images/{bait_image_name}"
-    bait_image_caption = f"Ideal bait presentation for {selected_species}"
-
 # =====================================================
-# TABS
+# Tabs content
 # =====================================================
-
-tabs = st.tabs([
-    "🏠 Home",
-    "🎯 Recommendation",
-    "🛰️ Map",
-    "🎣 Bait & Trace",
-    "🌊 Conditions",
-    "🛡️ Safety",
-    "📏 Regulations",
-    "💎 Packages",
-    "📘 Guide",
-    "❓ FAQ"
-])
-
-# =====================================================
-# HOME
-# =====================================================
-
 with tabs[0]:
     st.markdown("""
     # 🎣 CastIQ Pro
-
     ### More fishing. Less guessing.
-
-    Every angler knows the feeling.
-
-    You wake up early, pack the rods, buy bait, drive to the coast, walk the beach, scan the water…  
-    and still spend hours wondering:
-
-    **Am I standing in the right place?**  
-    **Am I casting into the right water?**  
-    **Am I using the right bait for what is actually feeding here?**
-
-    Fishing time is limited.  
-    Bait costs money.  
-    Fuel costs money.  
-    And too many sessions become trial and error.
-
-    **CastIQ Pro was built to shift the odds in your favour.**
-
-    It combines location, structure, bait, species behaviour, weather, wind, swell, tide, moon phase and safety logic to give you a more informed fishing decision before you cast.
+    Search any South African location, choose your bait, then let the app rank nearby fishing options and snap the fishing setup to the coastline.
     """)
-
-    st.divider()
-
-    st.markdown("## Make better decisions before you cast")
-
     c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.markdown("### 📍 **WHERE to stand**")
-        st.caption("GPS-guided positioning")
-        st.write("Identify the exact stand point based on structure, depth and fish behaviour.")
-
-    with c2:
-        st.markdown("### 🎯 **WHERE to cast**")
-        st.caption("Direction + distance")
-        st.write("Know the exact direction and distance to target feeding zones.")
-
-    with c3:
-        st.markdown("### 🎣 **WHAT bait to use**")
-        st.caption("Matched to species")
-        st.write("Use the right bait based on what is feeding in that structure.")
-
-    st.divider()
-
-    st.subheader("How CastIQ helps")
-
-    st.markdown("""
-    ✅ Finds the best spot within your travel range  
-    ✅ Uses specific micro-spots, not just broad area names  
-    ✅ Shows stand point and cast target  
-    ✅ Suggests bait and trace setup  
-    ✅ Shows finished bait presentation  
-    ✅ Reviews wind, weather, swell, tide and moon  
-    ✅ Adds safety and responsible fishing prompts  
-    ✅ Learns from your feedback over time  
-    """)
-
-    st.info("Start in the 🎯 Recommendation tab. Your settings are controlled from the sidebar.")
-    st.warning("CastIQ does not guarantee fish. It reduces guesswork and improves decision-making.")
-
-# =====================================================
-# RECOMMENDATION
-# =====================================================
+    c1.info("📍 Dynamic SA location search")
+    c2.info("🌊 Coastline snapping: stand on land, cast to sea")
+    c3.info("🎣 Bait-realistic species recommendation")
 
 with tabs[1]:
-    st.header("🎯 Best Fishing Recommendation")
+    st.header("🎯 Fishing Recommendation")
+    st.write(f"**Location basis:** {location_basis}")
+    st.write(f"**Planning GPS:** {user_location[0]:.6f}, {user_location[1]:.6f}")
+    st.subheader("Ranked fishing options in your selected radius")
+    display_df = pd.DataFrame([{k:v for k,v in r.items() if not k.startswith("_")} for r in ranked_rows])
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    new_label = st.selectbox("Select the fishing option you want to load", spot_labels, index=selected_idx)
+    if new_label != st.session_state.selected_spot_label:
+        st.session_state.selected_spot_label = new_label
+        st.rerun()
 
-    col1, col2 = st.columns([1, 1])
+    st.divider()
+    if bait_correction_msg:
+        st.warning(bait_correction_msg)
+    elif preferred_target != "Auto select":
+        st.success(f"Target/bait check passed for {selected_species}.")
 
+    col1, col2 = st.columns(2)
     with col1:
-        st.metric("My best recommendation", best_spot_name)
-        st.write(f"**Location basis:** {location_basis}")
-        st.write(f"**Distance from selected planning point:** {best_distance:.2f} km")
-        st.write(f"**Travel radius selected:** {max_travel_km} km")
-        st.write(f"**Closest available spot:** {closest_name} ({closest_distance:.2f} km)")
-        st.write(f"**Area:** {spot['area']}")
-        st.write(f"**Structure:** {spot['structure']}")
-        st.write(f"**Depth note:** {spot['depth_note']}")
-        st.write(f"**Why this spot:** {spot['notes']}")
-        st.write(f"**Micro-spot review score:** {best_review_score}")
-
+        st.metric("Loaded recommendation", best_name)
+        st.write(f"**Area:** {spot.get('area')}")
+        st.write(f"**Structure:** {spot.get('structure')}")
+        st.write(f"**Why this spot:** {spot.get('notes')}")
+        st.info(f"Coastline engine: {snap['source']} | distance from selected point to coast approx. {snap['distance_to_coast_m']}m")
     with col2:
         st.metric("Fishing confidence", f"{confidence}%")
         st.write(f"**Confidence level:** {confidence_label(confidence)}")
         st.write(f"**Selected target:** {selected_species}")
-        st.write(f"**Time:** {time_bucket} ({time_bucket_windows[time_bucket]})")
-        st.write(f"**Time logic:** {time_reason}")
+        st.write(f"**Time:** {time_bucket} ({TIME_BUCKET_WINDOWS[time_bucket]})")
+        st.write(f"**Tide:** {tide_stage} ({tide_data['source']})")
         st.write(f"**Bait logic:** {bait_message}")
         st.write(f"**Conditions score:** {condition_score}%")
-
-    st.subheader("📍 Stand Here → Cast There")
-
-    a, b, c, d = st.columns(4)
+    a,b,c,d = st.columns(4)
     a.metric("Stand GPS", f"{stand[0]:.6f}, {stand[1]:.6f}")
     b.metric("Cast GPS", f"{cast[0]:.6f}, {cast[1]:.6f}")
-    c.metric("Cast Distance", f"{int(cast_distance)} m")
+    c.metric("Cast distance", f"{int(cast_distance)} m")
     d.metric("Direction", f"{int(bearing)}° {compass}")
-
-    st.info(
-        f"Stand at the GPS point. Face {int(bearing)}° {compass}. "
-        f"Cast approximately {int(cast_distance)}m into the target structure."
-    )
-
-    if "Beginner" in casting_ability and cast_distance > 40:
-        st.warning("This target may be too far for a beginner. Look for closer white water or a near-shore channel.")
-    elif "Average" in casting_ability and cast_distance > 70:
-        st.warning("This cast is at the upper end for an average caster.")
-    elif "Strong" in casting_ability and cast_distance > 110:
-        st.warning("This cast may be beyond strong-caster range.")
-    else:
-        st.success("This casting distance matches your selected ability range.")
-
-# =====================================================
-# MAP
-# =====================================================
+    st.info(f"Stand at the person marker. Face {int(bearing)}° {compass}. Cast approximately {int(cast_distance)}m.")
 
 with tabs[2]:
     st.header("🛰️ Map + Navigation")
-
-    map_center = [(stand[0] + cast[0]) / 2, (stand[1] + cast[1]) / 2]
-    m = folium.Map(location=map_center, zoom_start=17, tiles=None)
-
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
-        name="Satellite",
-        overlay=False,
-        control=True
-    ).add_to(m)
-
-    folium.Marker(
-        [user_location[0], user_location[1]],
-        popup="Selected/current location",
-        tooltip="Planning point",
-        icon=folium.Icon(color="blue", icon="user")
-    ).add_to(m)
-
-    folium.Marker(
-        [stand[0], stand[1]],
-        popup="Stand here",
-        tooltip="Stand here",
-        icon=folium.Icon(color="green", icon="flag")
-    ).add_to(m)
-
-    folium.Marker(
-        [cast[0], cast[1]],
-        popup=f"Cast target: {int(cast_distance)}m",
-        tooltip="Cast target",
-        icon=folium.Icon(color="red", icon="screenshot")
-    ).add_to(m)
-
-    folium.PolyLine(
-        [[stand[0], stand[1]], [cast[0], cast[1]]],
-        weight=5,
-        opacity=0.9,
-        tooltip=f"Cast {int(cast_distance)}m at {int(bearing)}° {compass}"
-    ).add_to(m)
-
-    folium.Circle(
-        [cast[0], cast[1]],
-        radius=15,
-        popup="Estimated bait landing zone / target gully",
-        tooltip="Bait landing zone",
-        fill=True
-    ).add_to(m)
-
+    nav_plan = build_navigation_plan(user_location, stand, cast, snap["sea_bearing"], best_name, spot)
+    parking = nav_plan["parking"]
+    center = [(stand[0]+cast[0]+parking[0])/3, (stand[1]+cast[1]+parking[1])/3]
+    m = folium.Map(location=center, zoom_start=16, tiles=None)
+    folium.TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", attr="Esri World Imagery", name="Satellite").add_to(m)
+    folium.Marker(user_location, popup="Planning/search point", tooltip="Planning/search point", icon=folium.Icon(color="blue", icon="search", prefix="fa")).add_to(m)
+    folium.Marker(parking, popup="🅿️ Parking / access point", tooltip="🅿️ Parking / access point", icon=folium.Icon(color="purple", icon="car", prefix="fa")).add_to(m)
+    folium.Marker(snap["coast"], popup="Nearest coastline", tooltip="Nearest coastline", icon=folium.Icon(color="green", icon="water", prefix="fa")).add_to(m)
+    folium.Marker(stand, popup="🎣 Stand here", tooltip="🎣 Stand here", icon=folium.DivIcon(html='<div style="font-size:34px; line-height:34px; text-align:center;">🧍‍♂️</div>')).add_to(m)
+    folium.Marker(cast, popup="🎯 Cast target", tooltip="🎯 Cast target", icon=folium.Icon(color="red", icon="bullseye", prefix="fa")).add_to(m)
+    folium.PolyLine([parking, stand], color="orange", weight=5, tooltip=f"Walk-in route approx. {nav_plan['walk_distance_m']}m").add_to(m)
+    folium.PolyLine([stand, cast], color="blue", weight=5, tooltip=f"Cast {int(cast_distance)}m at {int(bearing)}° {compass}").add_to(m)
+    folium.Circle(cast, radius=18, fill=True, popup="Bait landing zone").add_to(m)
     st_folium(m, width=1150, height=560)
 
-    st.subheader("🧭 Take Me There")
+    st.subheader("🚗 Two-stage navigation")
+    n1, n2, n3 = st.columns(3)
+    with n1:
+        st.metric("Drive target", "Parking / access")
+        st.caption(nav_plan["parking_note"])
+        st.link_button("🚗 Navigate to parking", google_nav_url(user_location, parking, "driving"))
+        st.link_button("🚙 Open in Waze", waze_nav_url(parking))
+    with n2:
+        st.metric("Walk-in", f"±{nav_plan['walk_distance_m']} m")
+        st.caption("Use this once parked. Beach paths may not be perfectly mapped, so use the stand marker as the final target.")
+        st.link_button("🚶 Walk parking → stand", google_nav_url(parking, stand, "walking"))
+    with n3:
+        st.metric("Stand + cast", f"Face {nav_plan['face_bearing']}° {nav_plan['face_compass']}")
+        st.caption(f"Cast approximately {int(cast_distance)}m to the target marker.")
+        st.link_button("📍 Walk my current point → stand", google_nav_url(user_location, stand, "walking"))
 
-    google_drive = f"https://www.google.com/maps/dir/?api=1&destination={stand[0]},{stand[1]}&travelmode=driving"
-    google_walk = f"https://www.google.com/maps/dir/?api=1&destination={stand[0]},{stand[1]}&travelmode=walking"
-    waze = f"https://waze.com/ul?ll={stand[0]},{stand[1]}&navigate=yes"
-
-    nav_choice = st.selectbox(
-        "Choose navigation option",
-        ["Google Maps - Drive", "Google Maps - Walk", "Waze"]
-    )
-
-    if nav_choice == "Google Maps - Drive":
-        st.link_button("🚗 Open Google Maps Driving", google_drive)
-    elif nav_choice == "Google Maps - Walk":
-        st.link_button("🚶 Open Google Maps Walking", google_walk)
-    else:
-        st.link_button("🚘 Open Waze", waze)
-
-    st.caption("Navigation opens outside CastIQ. Confirm access route, parking and local restrictions before travelling.")
-
-# =====================================================
-# BAIT + TRACE
-# =====================================================
-
+    st.subheader("🔊 Voice-style stand instructions")
+    instruction_text = " ".join(nav_plan["instructions"])
+    for i, step in enumerate(nav_plan["instructions"], 1):
+        st.write(f"**{i}.** {step}")
+    components.html(f"""
+        <button onclick="speechSynthesis.cancel(); var u = new SpeechSynthesisUtterance({instruction_text!r}); u.rate = 0.92; u.pitch = 1; speechSynthesis.speak(u);" style="padding:10px 14px;border-radius:10px;border:1px solid #ddd;cursor:pointer;">🔊 Read directions aloud</button>
+        <button onclick="speechSynthesis.cancel();" style="padding:10px 14px;border-radius:10px;border:1px solid #ddd;cursor:pointer;margin-left:8px;">Stop voice</button>
+    """, height=55)
+    st.warning("Navigation is advisory. Confirm public access, legal parking, surf conditions, tides and personal safety before walking to the stand point.")
 with tabs[3]:
     st.header("🎣 Bait & Trace")
-
-    st.subheader("Bait Decision")
-    st.write(f"**Selected target:** {selected_species}")
+    st.write(f"**Selected target used for report:** {selected_species}")
     st.write(f"**Ideal bait:** {', '.join(species['ideal_baits'])}")
-
-    if available_baits:
-        st.write(f"**Bait you have:** {', '.join(available_baits)}")
-
-    if bait_status == "Good match":
-        st.success(f"✅ {bait_message}")
-    elif bait_status == "Poor match":
-        st.warning(f"⚠️ {bait_message}")
-
-        if alternative_targets:
-            st.info(f"Better target based on your bait at this spot: {', '.join(alternative_targets)}")
-        else:
-            st.info(f"Recommended to obtain: {', '.join(species['ideal_baits'])}")
-    else:
-        st.info("Select bait in the sidebar to get bait-matching advice.")
-
-    st.subheader("🖼️ Finished Bait Presentation")
-
-    if bait_image_path and os.path.exists(bait_image_path):
-        st.image(bait_image_path, caption=bait_image_caption, use_container_width=True)
-    else:
-        st.info(f"Bait image not loaded yet. Add image here: {bait_image_path}")
-
-    st.subheader("🧵 Trace Recommendation")
-
-    trace_image_path = species.get("trace_image")
-
-    if trace_image_path and os.path.exists(trace_image_path):
-        st.image(trace_image_path, caption=f"{selected_species} completed trace setup", use_container_width=True)
-    else:
-        st.info(f"Trace image not loaded yet. Add image here: {trace_image_path}")
-        st.code(species["trace_diagram"])
-
+    st.write(f"**Your bait:** {', '.join(available_baits) if available_baits else 'Not selected'}")
+    if bait_status == "Good match": st.success(bait_message)
+    elif bait_status == "Poor match": st.warning(bait_message)
+    else: st.info(bait_message)
+    st.subheader("Recommended trace")
+    st.write(species["trace"])
+    st.code(species["trace_diagram"])
     st.subheader("🐟 Bite Behaviour")
     st.write(f"**Bite style:** {species['bite_style']}")
-    st.write(f"**What it feels like:** {species['feel']}")
-    st.write(f"**What you must do:** {species['response']}")
+    st.write(f"**Feel:** {species['feel']}")
+    st.write(f"**Response:** {species['response']}")
     st.warning(f"Common mistake: {species['mistake']}")
 
-# =====================================================
-# CONDITIONS
-# =====================================================
-
 with tabs[4]:
-    st.header("🌊 Fishing Conditions Summary")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
+    st.header("🌊 Conditions")
+    c1,c2,c3 = st.columns(3)
+    with c1:
         st.subheader("Weather")
         if conditions.get("available"):
             st.write(f"Temperature: {conditions.get('temperature')} °C")
             st.write(f"Weather: {weather_code_text(conditions.get('weather_code'))}")
             st.write(f"Rain probability: {conditions.get('rain_probability')}%")
             st.write(f"Pressure: {conditions.get('pressure')} hPa")
-            st.write(f"Cloud cover: {conditions.get('cloud_cover')}%")
-        else:
-            st.warning("Weather data unavailable.")
-
-    with col2:
+            st.write(f"Gusts: {conditions.get('wind_gusts')} km/h")
+        else: st.warning("Weather unavailable")
+        if conditions.get("weather_error"): st.warning(conditions["weather_error"])
+    with c2:
         st.subheader("Wind + Marine")
         st.write(f"Wind: {conditions.get('wind_speed')} km/h from {direction_text(conditions.get('wind_direction'))}")
         st.write(f"Wave height: {conditions.get('wave_height')} m")
         st.write(f"Wave period: {conditions.get('wave_period')} sec")
         st.write(f"Wave direction: {direction_text(conditions.get('wave_direction'))}")
-        st.write(f"Sea temperature: {conditions.get('sea_temp')} °C")
-
-    with col3:
+        st.write(f"Swell: {conditions.get('swell_height')} m / {conditions.get('swell_period')} sec")
+        st.write(f"Sea temp: {conditions.get('sea_temp')} °C")
+        if conditions.get("marine_error"): st.warning(conditions["marine_error"])
+    with c3:
         st.subheader("Tide + Moon")
         st.write(f"Tide stage: {tide_stage}")
+        st.write(f"Tide source: {tide_data['source']}")
+        st.caption(tide_data["status"])
         st.write(f"Moon phase: {moon_phase}")
         st.metric("Conditions score", f"{condition_score}%")
-
-    if cond_pos:
-        st.success("Positive signals: " + " | ".join(cond_pos))
-    if cond_neg:
-        st.warning("Caution signals: " + " | ".join(cond_neg))
-
-# =====================================================
-# SAFETY
-# =====================================================
+    if tide_data.get("next_tides"):
+        st.dataframe(pd.DataFrame(tide_data["next_tides"]), use_container_width=True)
+    if cond_pos: st.success("Positive signals: " + " | ".join(cond_pos))
+    if cond_neg: st.warning("Caution signals: " + " | ".join(cond_neg))
 
 with tabs[5]:
     st.header("🛡️ Safety")
-
-    safety = safety_ratings.get(best_spot_name, {
-        "risk": "Unknown",
-        "advice": "No safety profile loaded yet. Fish with caution and verify local conditions."
-    })
-
-    risk = safety["risk"]
-
-    if "Low" in risk and "Medium" not in risk:
-        st.success(f"Safety risk: {risk}")
-    elif "Medium" in risk:
-        st.warning(f"Safety risk: {risk}")
-    else:
-        st.error(f"Safety risk: {risk}")
-
-    st.write(f"**Safety advice:** {safety['advice']}")
-
-    st.warning("""
-    Safety prompts:
-    - Avoid isolated fishing at night.
-    - Do not leave valuables visible in your vehicle.
-    - Check wave sets before fishing rocks.
-    - Fish with someone where practical.
-    - Avoid closed, restricted or unsafe access areas.
-    """)
-
-# =====================================================
-# REGULATIONS
-# =====================================================
+    st.warning("Safety risk: Medium / verify locally")
+    st.write("Check surf sets, rocks, parking, access rights, lighting and security. Avoid isolated night fishing and do not fish dangerous ledges in big swell.")
+    if snap["distance_to_coast_m"] > 3000:
+        st.info("Your searched/GPS point appears inland. The app snapped the fishing setup to the nearest coastline. Confirm the actual access route before travelling.")
 
 with tabs[6]:
-    st.header("📏 Regulation Engine")
-
-    st.subheader(f"Selected Target Regulation: {selected_species}")
-
-    reg = regulation_data.get(selected_species)
-
+    st.header("📏 Regulations")
+    reg = REGULATIONS.get(selected_species)
     if reg:
-        r1, r2, r3 = st.columns(3)
+        r1,r2,r3 = st.columns(3)
         r1.metric("Bag limit", reg["bag"])
         r2.metric("Minimum size", reg["min_size"])
         r3.metric("Protected", reg["protected"])
-
-        st.write(f"**Closed season:** {reg['closed']}")
-        st.write(f"**MPA check:** {reg['mpa']}")
-        st.write(f"**Feedback rule:** {reg['feedback']}")
+        st.write(f"Closed season: {reg['closed']}")
+        st.write(f"MPA check: {reg['mpa']}")
+        st.info(reg["feedback"])
     else:
-        st.warning("Regulation record not loaded yet for this species.")
-
-    st.subheader("Full Regulation Table")
-    st.dataframe(regulation_table, use_container_width=True)
-
-    st.warning(
-        "Prototype regulation guide only. Always verify current South African recreational fishing rules, local bylaws and MPA restrictions before keeping fish."
-    )
-
-# =====================================================
-# PACKAGES
-# =====================================================
+        st.warning("Regulation not loaded for this species yet.")
+    st.dataframe(REG_TABLE, use_container_width=True, hide_index=True)
+    st.warning("Prototype regulation guide only. Verify current South African regulations, MPAs, closed seasons and local rules before keeping fish.")
 
 with tabs[7]:
     st.header("💎 Packages")
-
-    p1, p2, p3, p4 = st.columns(4)
-
-    with p1:
-        st.subheader("Free")
-        st.write("Basic area guidance, responsible fishing reminders.")
-        st.video("https://www.youtube.com/watch?v=REPLACE_FREE_VIDEO_ID")
-
-    with p2:
-        st.subheader("Pro")
-        st.write("Exact GPS stand/cast, bait matching, trace visuals.")
-        st.video("https://www.youtube.com/watch?v=REPLACE_PRO_VIDEO_ID")
-
-    with p3:
-        st.subheader("Elite")
-        st.write("Conditions intelligence, micro-spot ranking, premium logic.")
-        st.video("https://www.youtube.com/watch?v=REPLACE_ELITE_VIDEO_ID")
-
-    with p4:
-        st.subheader("Guide")
-        st.write("Client planning, group sessions, trip reports.")
-        st.video("https://www.youtube.com/watch?v=REPLACE_GUIDE_VIDEO_ID")
-
-# =====================================================
-# GUIDE
-# =====================================================
+    for title, desc in [("Free", "Area-level guidance"), ("Pro", "Ranked spots + bait + trace"), ("Elite", "Dynamic coastline + live tide/weather"), ("Guide", "Client planning and trip packs")]:
+        st.subheader(title); st.write(desc)
 
 with tabs[8]:
     st.header("📘 User Guide")
-
     st.markdown("""
-    ### How to use CastIQ Pro
-
-    1. Choose your location method in the sidebar.
-    2. Select where you are or where you plan to fish from.
-    3. Choose how far you are willing to travel.
-    4. Select time, tide stage, bait and target species.
-    5. Review the best micro-spot recommendation.
-    6. Open the Map tab for stand/cast points.
-    7. Check bait, trace, conditions, safety and regulations.
-    8. Fish responsibly.
-    9. Submit feedback after the session.
+    1. Search any South African location or use GPS.
+    2. Set radius, time, bait and target species.
+    3. Recommendation tab shows all ranked options high-to-low.
+    4. Select any option to refresh the full recommendation.
+    5. Map shows planning point, coastline point, stand point and cast point.
+    6. Bait mismatch automatically suggests a better species and completes the report for that species.
     """)
-
-# =====================================================
-# FAQ
-# =====================================================
 
 with tabs[9]:
     st.header("❓ FAQ")
-
     st.markdown("""
-    **Does CastIQ guarantee fish?**  
-    No. It improves decision-making but fishing still depends on real conditions.
+    **Does CastIQ guarantee fish?** No. It improves decision-making.
 
-    **Why does the app choose one spot over another?**  
-    It scores structure, distance, time, bait suitability, species match and conditions.
+    **Why no manual tide dropdown?** Normal users should not have to guess tides. Live tide loads automatically; otherwise an estimate is used. Manual override is under Advanced settings only.
 
-    **Why is the spot now more specific than just Umhlanga?**  
-    The app now uses micro-spots such as Lighthouse Gully, Lagoon Mouth and Bronze Beach Gully.
-
-    **Why does bait matter?**  
-    Different fish feed differently. The app checks what you have against the target species.
-
-    **Why do I need to check safety and regulations?**  
-    Because better fishing intelligence must be matched with responsible behaviour.
-
-    **Does this work outside South Africa?**  
-    The model can be expanded globally by loading local spots, species and regulations.
+    **Why does the app move my point?** If your selected location is inland or inside a city, the coastline engine snaps the fishing setup to the nearest coast.
     """)
-
-# =====================================================
-# FEEDBACK
-# =====================================================
 
 st.divider()
 st.subheader("💬 Feedback / Accuracy Improvement")
-
 with st.form("feedback_form"):
-    result = st.selectbox(
-        "Did the recommendation work?",
-        ["Not fished yet", "Yes - caught fish", "Had bites only", "No action", "Wrong spot", "Wrong bait", "Wrong trace", "Wrong species"]
-    )
-
+    result = st.selectbox("Did the recommendation work?", ["Not fished yet", "Yes - caught fish", "Had bites only", "No action", "Wrong spot", "Wrong bait", "Wrong trace", "Wrong species"])
     actual_species = st.text_input("What species did you catch or see?")
     actual_bait = st.text_input("What bait worked or failed?")
     catch_outcome = st.selectbox("Catch outcome", ["No catch", "Released", "Kept legally", "Unsure"])
     comments = st.text_area("Your suggestion / improvement")
-
-    submitted = st.form_submit_button("Submit Feedback")
-
-    if submitted:
-        feedback = {
-            "timestamp": datetime.now().isoformat(),
-            "location_basis": location_basis,
-            "user_lat": user_location[0],
-            "user_lon": user_location[1],
-            "trip_date": str(trip_date),
-            "time_bucket": time_bucket,
-            "tide_stage": tide_stage,
-            "condition_score": condition_score,
-            "travel_range_km": max_travel_km,
-            "closest_spot": closest_name,
-            "recommended_best_spot": best_spot_name,
-            "target_species": selected_species,
-            "available_baits": ", ".join(available_baits),
-            "recommended_bait": species["bait"],
-            "bait_status": bait_status,
-            "result": result,
-            "actual_species": actual_species,
-            "actual_bait": actual_bait,
-            "catch_outcome": catch_outcome,
-            "comments": comments,
-            "confidence": confidence,
-            "cast_distance_m": int(cast_distance),
-            "bearing": int(bearing),
-        }
-
+    if st.form_submit_button("Submit Feedback"):
+        feedback = {"timestamp": datetime.now().isoformat(), "location_basis": location_basis, "user_lat": user_location[0], "user_lon": user_location[1], "trip_date": str(trip_date), "time_bucket": time_bucket, "tide_stage": tide_stage, "tide_source": tide_data["source"], "condition_score": condition_score, "travel_range_km": max_travel_km, "recommended_best_spot": best_name, "target_species": selected_species, "available_baits": ", ".join(available_baits), "bait_status": bait_status, "result": result, "actual_species": actual_species, "actual_bait": actual_bait, "catch_outcome": catch_outcome, "comments": comments, "confidence": confidence, "cast_distance_m": int(cast_distance), "bearing": int(bearing)}
         df = pd.DataFrame([feedback])
-
-        try:
-            existing = pd.read_csv(FEEDBACK_FILE)
-            df = pd.concat([existing, df], ignore_index=True)
-        except FileNotFoundError:
-            pass
-
+        try: df = pd.concat([pd.read_csv(FEEDBACK_FILE), df], ignore_index=True)
+        except FileNotFoundError: pass
         df.to_csv(FEEDBACK_FILE, index=False)
+        st.success("Feedback saved.")
 
-        st.success("Feedback saved. This will improve future recommendations.")
-
-st.divider()
 st.caption("Prototype only. Always verify local regulations, conditions, access rights and safety before fishing.")
