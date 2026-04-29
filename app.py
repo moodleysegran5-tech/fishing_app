@@ -703,7 +703,7 @@ st.sidebar.header("📍 Location")
 
 location_method = st.sidebar.radio(
     "Choose location method",
-    ["Use current GPS", "Enter coordinates", "Choose planning area"]
+    ["Use current Location", "Enter coordinates", "Choose planning area"]
 )
 
 location_basis = "Unknown"
