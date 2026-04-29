@@ -43,7 +43,7 @@ st.set_page_config(page_title="CastIQ Pro", page_icon="🎣", layout="wide")
 
 APP_NAME = "CastIQ Pro"
 FEEDBACK_FILE = "feedback_log.csv"
-API_CACHE_TTL_SECONDS = 1800
+API_CACHE_TTL_SECONDS = 7200
 REQUEST_HEADERS = {
     "User-Agent": "CastIQ-Pro/1.0 contact=local-test",
     "Accept": "application/json",
@@ -665,6 +665,8 @@ def overpass_coastal_features(lat: float, lon: float, radius_m: int = 9000) -> L
     Finds beach/coast related OSM features near a point.
     We use this for dynamic ranked coastal options and approximate coastline points.
     """
+    if st.session_state.get("FAST_MODE", True):
+        return []
     query = f"""
     [out:json][timeout:15];
     (
@@ -706,6 +708,126 @@ def overpass_coastal_features(lat: float, lon: float, radius_m: int = 9000) -> L
     return features[:30]
 
 
+
+@st.cache_data(ttl=API_CACHE_TTL_SECONDS)
+def overpass_access_features(lat: float, lon: float, radius_m: int = 2500) -> List[Dict[str, Any]]:
+    """
+    Finds realistic parking/access points near the fishing stand.
+    Looks for roads, public parking, and access paths.
+    """
+    if st.session_state.get("FAST_MODE", True):
+        return []
+    query = f"""
+    [out:json][timeout:15];
+    (
+      node(around:{radius_m},{lat},{lon})["amenity"="parking"];
+      way(around:{radius_m},{lat},{lon})["amenity"="parking"];
+      node(around:{radius_m},{lat},{lon})["highway"~"residential|service|tertiary|secondary|unclassified|track|path|footway"];
+      way(around:{radius_m},{lat},{lon})["highway"~"residential|service|tertiary|secondary|unclassified|track|path|footway"];
+    );
+    out center tags 120;
+    """
+    data = safe_request_json("https://overpass-api.de/api/interpreter", params={"data": query}, timeout=20, retries=0)
+    if not data or "elements" not in data:
+        return []
+
+    features = []
+    seen = set()
+    for el in data["elements"]:
+        tags = el.get("tags", {})
+        if "lat" in el and "lon" in el:
+            flat, flon = float(el["lat"]), float(el["lon"])
+        elif "center" in el:
+            flat, flon = float(el["center"]["lat"]), float(el["center"]["lon"])
+        else:
+            continue
+
+        key = (round(flat, 5), round(flon, 5), tags.get("amenity", ""), tags.get("highway", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        feature_type = tags.get("amenity") or tags.get("highway") or "access"
+        name = tags.get("name") or feature_type
+
+        features.append({
+            "name": name,
+            "lat": flat,
+            "lon": flon,
+            "type": feature_type,
+            "tags": tags,
+        })
+
+    return features
+
+
+def score_access_feature(feature: Dict[str, Any], stand: Tuple[float, float], land_bearing: float) -> float:
+    """
+    Scores parking/access features. We prefer road/parking features on the land side and
+    not too close to the stand/wash zone.
+    """
+    point = (feature["lat"], feature["lon"])
+    d = distance_m(point, stand)
+    bearing_from_stand = calculate_bearing(stand, point)
+
+    # Bearing closeness to land direction
+    diff = abs((bearing_from_stand - land_bearing + 180) % 360 - 180)
+
+    score = 1000
+    score -= d * 0.45
+    score -= diff * 4
+
+    ftype = str(feature.get("type", "")).lower()
+    if ftype == "parking":
+        score += 280
+    elif ftype in ["service", "residential", "tertiary", "secondary", "unclassified"]:
+        score += 160
+    elif ftype in ["track", "path", "footway"]:
+        score += 60
+
+    # Too close to stand can be beach/river/water, not actual parking.
+    if d < 80:
+        score -= 250
+    if d > 2500:
+        score -= 300
+
+    return score
+
+
+def find_realistic_parking_and_access(
+    stand: Tuple[float, float],
+    planning_point: Tuple[float, float],
+    land_bearing: float,
+) -> Tuple[Tuple[float, float], Tuple[float, float], str]:
+    """
+    Returns parking point, walk access point, source note.
+    - Parking should be on road/parking side, not in water.
+    - Walk access point is between parking and stand, nearer to shoreline.
+    """
+    features = overpass_access_features(stand[0], stand[1], radius_m=2500)
+
+    if features:
+        ranked = sorted(features, key=lambda f: score_access_feature(f, stand, land_bearing), reverse=True)
+        best = ranked[0]
+        parking = (best["lat"], best["lon"])
+        source = f"OSM access: {best['name']} ({best['type']})"
+    else:
+        # Fallback: move landward, but much further than before to avoid river/beach placement.
+        parking = destination_point(stand, land_bearing, 650)
+        source = "Fallback landward parking estimate"
+
+    # Access point: do not draw a fake straight walk through water from parking to stand.
+    # Instead route visually to a beach-access point first, then to stand.
+    access_point = destination_point(stand, land_bearing, 90)
+
+    # If parking ended too close to water/stand, force it further landward.
+    if distance_m(parking, stand) < 120:
+        parking = destination_point(stand, land_bearing, 650)
+        source = source + " | adjusted landward"
+
+    return parking, access_point, source
+
+
 def snap_point_to_coast(
     planning_point: Tuple[float, float],
     area_name: str,
@@ -738,10 +860,17 @@ def snap_point_to_coast(
     sea_bearing = profile["sea"]
     stand = destination_point(coast_point, land_bearing, profile["stand_inland_m"])
     cast = destination_point(coast_point, sea_bearing, profile["cast_m"])
-    parking = destination_point(stand, land_bearing, 250)
+
+    parking, access_point, parking_source = find_realistic_parking_and_access(
+        stand=stand,
+        planning_point=planning_point,
+        land_bearing=land_bearing,
+    )
 
     return parking, stand, cast, {
         "coast_source": coast_source,
+        "parking_source": parking_source,
+        "access_point": access_point,
         "sea_bearing": sea_bearing,
         "land_bearing": land_bearing,
         "stand_inland_m": profile["stand_inland_m"],
@@ -870,6 +999,15 @@ def estimate_tide_stage(bucket: str, moon: str) -> str:
 
 
 def get_tide_data(lat, lon, trip_date_str, bucket, moon):
+    if st.session_state.get("FAST_MODE", True):
+        return {
+            "available": False,
+            "source": "Fast estimated tide",
+            "status": "Fast testing mode: tide API calls skipped. Use Full live intelligence for live tide lookup.",
+            "next_tides": [],
+            "stage": estimate_tide_stage(bucket, moon),
+        }
+
     wt = fetch_worldtides(lat, lon, trip_date_str, WORLD_TIDES_API_KEY)
     if wt["available"]:
         return wt
@@ -1389,13 +1527,25 @@ with st.sidebar.expander("API status"):
     st.write(f"Stormglass key: {'Loaded' if STORMGLASS_API_KEY else 'Not configured'}")
     st.caption("No key = no crash. App uses fallback logic.")
 
+performance_mode = st.sidebar.selectbox(
+    "Performance mode",
+    ["Fast testing", "Full live intelligence"],
+    index=0,
+    help="Fast testing avoids slow live OSM/tide calls. Full live intelligence uses more APIs and can be slower.",
+)
+st.session_state["FAST_MODE"] = performance_mode == "Fast testing"
+
+if st.sidebar.button("Clear app cache"):
+    st.cache_data.clear()
+    st.rerun()
+
 
 # =====================================================
 # Main
 # =====================================================
 
 st.markdown(f"<div class='main-title'>🎣 {APP_NAME}</div>", unsafe_allow_html=True)
-st.caption("AI Fishing Intelligence: where to park, where to stand, where to cast, and what to use.")
+st.caption(f"AI Fishing Intelligence: where to park, where to stand, where to cast, and what to use. Mode: {performance_mode}")
 
 show_dev_tools = st.sidebar.checkbox("🛠 Developer mode", value=False)
 
@@ -1531,6 +1681,7 @@ with tabs[1]:
     selected_name = st.session_state.selected_option_label.split(" — ")[0]
     loaded = detailed[selected_name]
     parking, stand, cast = loaded["parking"], loaded["stand"], loaded["cast"]
+    access_point = loaded["coast_meta"].get("access_point")
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
     cast_distance = distance_m(stand, cast)
@@ -1551,7 +1702,8 @@ with tabs[1]:
 
     st.info(
         f"Parking note: {loaded['spot'].get('parking_note', 'Use nearest legal public parking/access.')}\n\n"
-        f"Then walk to the stand point and cast {int(cast_distance)}m towards {compass}."
+        f"Parking/access source: {loaded['coast_meta'].get('parking_source', 'Not available')}\n\n"
+        f"Then walk via the beach access point to the stand point and cast {int(cast_distance)}m towards {compass}."
     )
 
     if folium and st_folium:
@@ -1563,10 +1715,12 @@ with tabs[1]:
             name="Satellite",
         ).add_to(m)
         folium.Marker(planning_point, tooltip="Planning point", icon=folium.Icon(color="blue", icon="search", prefix="fa")).add_to(m)
-        folium.Marker(parking, tooltip="Parking / access point", icon=folium.Icon(color="green", icon="car", prefix="fa")).add_to(m)
+        folium.Marker(parking, tooltip="Parking / road access", icon=folium.Icon(color="green", icon="car", prefix="fa")).add_to(m)
+        if access_point:
+            folium.Marker(access_point, tooltip="Beach access point", icon=folium.Icon(color="orange", icon="map-signs", prefix="fa")).add_to(m)
         folium.Marker(stand, tooltip="Stand here", icon=folium.DivIcon(html='<div style="font-size:34px;">🧍‍♂️</div>')).add_to(m)
         folium.Marker(cast, tooltip="Cast target", icon=folium.Icon(color="red", icon="bullseye", prefix="fa")).add_to(m)
-        folium.PolyLine([parking, stand], color="green", weight=4, tooltip="Walk route").add_to(m)
+        folium.PolyLine([parking, access_point, stand] if access_point else [parking, stand], color="green", weight=4, tooltip="Suggested walk path").add_to(m)
         folium.PolyLine([stand, cast], color="blue", weight=5, tooltip=f"Cast {int(cast_distance)}m {compass}").add_to(m)
         folium.Circle(cast, radius=18, fill=True, tooltip="Bait landing zone").add_to(m)
         st_folium(m, width=1200, height=600)
@@ -1575,10 +1729,11 @@ with tabs[1]:
 
     st.subheader("Voice-style directions")
     directions = [
-        "Drive to the parking or access point first.",
-        "Check that parking and beach access are legal and safe.",
-        "Walk from the parking point towards the stand marker.",
-        "Stop on safe dry sand or safe rock above the wash line.",
+        "Drive to the road-side parking or public access point first.",
+        "Confirm the parking/access is legal and safe before leaving your vehicle.",
+        "Walk towards the beach access marker first; do not cross river channels or unsafe water.",
+        "From the access point, walk along safe dry sand or stable rock towards the stand marker.",
+        "Stop above the wash line and reassess waves, current and footing.",
         human_direction_text(compass).replace(".", ""),
         f"Cast towards {compass}, bearing {int(bearing)} degrees, around {int(cast_distance)} metres.",
     ]
@@ -1719,154 +1874,4 @@ with tabs[6]:
     def package_card(image_path, title, persona, price, description, features, button_label):
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
         if os.path.exists(image_path):
-            st.image(image_path, use_container_width=True)
-        else:
-            st.info(f"Add image: {image_path}")
-        st.subheader(title)
-        st.caption(persona)
-        st.markdown(f"### {price}")
-        st.write(description)
-        for feature in features:
-            st.write(f"✅ {feature}")
-        st.button(button_label, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        package_card(
-            "assets/standard.jpg",
-            "STANDARD 🎣",
-            "Standard Fisherman",
-            "R0",
-            "Basic shoreline guidance for casual fishing sessions.",
-            [
-                "Search fishing areas",
-                "Basic conditions view",
-                "Simple recommendations",
-            ],
-            "Start Free",
-        )
-
-    with col2:
-        package_card(
-            "assets/pro.jpg",
-            "PRO ⭐",
-            "Pro Fisherman",
-            "R49 / month",
-            "Fish smarter with ranked options and guided decisions.",
-            [
-                "Exact stand and cast direction",
-                "Bait and species matching",
-                "Ranked fishing spots",
-                "Parking to stand navigation",
-            ],
-            "Upgrade to Pro",
-        )
-
-    with col3:
-        package_card(
-            "assets/elite.jpg",
-            "ELITE 🔥",
-            "Elite Fisherman",
-            "R99 / month",
-            "Full real-time coastal intelligence for serious anglers.",
-            [
-                "Live/current location support",
-                "Dynamic coastline engine",
-                "On-the-Beach Mode",
-                "Advanced condition scoring",
-            ],
-            "Go Elite",
-        )
-
-with tabs[7]:
-    selected_name = st.session_state.selected_option_label.split(" — ")[0]
-    loaded = detailed[selected_name]
-
-    st.header("💬 Feedback / Accuracy Improvement")
-    with st.form("feedback_form"):
-        result = st.selectbox("Did the recommendation work?", ["Not fished yet", "Yes - caught fish", "Had bites only", "No action", "Wrong spot", "Wrong bait", "Wrong trace", "Wrong species"])
-        actual_species = st.text_input("What species did you catch or see?")
-        actual_bait = st.text_input("What bait worked or failed?")
-        catch_outcome = st.selectbox("Catch outcome", ["No catch", "Released", "Kept legally", "Unsure"])
-        comments = st.text_area("Your suggestion / improvement")
-        submitted = st.form_submit_button("Submit Feedback")
-
-        if submitted:
-            feedback = {
-                "timestamp": datetime.now().isoformat(),
-                "location_basis": location_basis,
-                "planning_lat": planning_point[0],
-                "planning_lon": planning_point[1],
-                "trip_date": str(trip_date),
-                "time_bucket": time_bucket,
-                "recommended_spot": selected_name,
-                "target_species": loaded["selected_species"],
-                "available_baits": ", ".join(available_baits),
-                "result": result,
-                "actual_species": actual_species,
-                "actual_bait": actual_bait,
-                "catch_outcome": catch_outcome,
-                "comments": comments,
-                "confidence": loaded["final_confidence"],
-                "condition_score": loaded["condition_score"],
-                "spot_potential": loaded["score_detail"]["raw_spot_potential"],
-            }
-            df_new = pd.DataFrame([feedback])
-            try:
-                df_old = pd.read_csv(FEEDBACK_FILE)
-                df_all = pd.concat([df_old, df_new], ignore_index=True)
-            except Exception:
-                df_all = df_new
-            df_all.to_csv(FEEDBACK_FILE, index=False)
-            st.success("Feedback saved. This will support the future learning engine.")
-
-
-
-
-if show_dev_tools:
-    with tabs[8]:
-        st.header("🧪 Auto Test")
-        st.caption("Run this after every code change. It checks the main logic across common SA coastal locations.")
-
-        st.info(
-            "This test checks location search, ranked recommendations, confidence matching, "
-            "parking/stand/cast coordinates, bait mismatch override, weather API, and tide fallback."
-        )
-
-        if st.button("Run Auto Test", use_container_width=True):
-            with st.spinner("Running CastIQ auto tests..."):
-                test_df = run_auto_tests()
-
-            status_counts = test_df["Status"].value_counts().to_dict() if not test_df.empty else {}
-            c1, c2, c3 = st.columns(3)
-            c1.metric("PASS", status_counts.get("PASS", 0))
-            c2.metric("WARN", status_counts.get("WARN", 0))
-            c3.metric("FAIL", status_counts.get("FAIL", 0))
-
-            if status_counts.get("FAIL", 0) > 0:
-                st.error("Some tests failed. Review the table below and send a screenshot.")
-            elif status_counts.get("WARN", 0) > 0:
-                st.warning("No hard failures, but warnings need review.")
-            else:
-                st.success("All auto tests passed.")
-
-            st.dataframe(test_df, use_container_width=True, hide_index=True)
-
-            csv = test_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download test report CSV",
-                data=csv,
-                file_name="castiq_auto_test_report.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        with st.expander("What PASS / WARN / FAIL means"):
-            st.write("**PASS** = Logic worked as expected.")
-            st.write("**WARN** = App did not crash, but result should be reviewed manually.")
-            st.write("**FAIL** = Something is broken and should be fixed before relying on the app.")
-
-
-st.caption("Prototype only. Always verify safety, access rights, sea conditions and official fishing regulations.")
+            st.image(image_path, use_container_width
