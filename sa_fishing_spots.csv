@@ -1,0 +1,83 @@
+region,area,spot_name,province,lat,lon,spot_type,main_species,structure,parking_note
+KZN North Coast,Kosi Bay,Kosi Bay Mouth,KwaZulu-Natal,-26.903,32.876,estuary mouth,Kingfish;Garrick / Leervis;Kob;Shad / Elf,"Estuary mouth, sandbanks and surf channels",Use legal access; check iSimangaliso rules and permits
+KZN North Coast,Sodwana Bay,Sodwana Bay Beach,KwaZulu-Natal,-27.536,32.676,beach,Kingfish;Shad / Elf;Kob;Pompano,Surf beach with gutters and banks,Use public beach access; check park rules
+KZN North Coast,Cape Vidal,Cape Vidal Beach,KwaZulu-Natal,-28.124,32.562,beach,Kingfish;Shad / Elf;Kob;Pompano,"Surf beach, reef edges and sandbanks",Use designated access; check iSimangaliso rules
+KZN North Coast,St Lucia,St Lucia Estuary Mouth,KwaZulu-Natal,-28.378,32.417,river mouth,Kob;Garrick / Leervis;Spotted Grunter;Shad / Elf,"Estuary mouth, current seam and surf zone",Park at legal beach/estuary access
+KZN North Coast,Richards Bay,Richards Bay Harbour Wall,KwaZulu-Natal,-28.801,32.096,harbour wall,Kob;Kingfish;Shad / Elf;Grey Shark,"Harbour wall, deep water and current edges",Check harbour access restrictions
+KZN North Coast,Zinkwazi,Zinkwazi Lagoon Mouth,KwaZulu-Natal,-29.283,31.445,river mouth,Kob;Garrick / Leervis;Spotted Grunter;Pompano,Lagoon mouth and surf seam,Use public beach access
+KZN North Coast,Blythedale,Blythedale Beach,KwaZulu-Natal,-29.37,31.348,beach,Kob;Shad / Elf;Pompano;Grey Shark,Long surf beach with gutters,Use public beach parking
+KZN North Coast,Ballito,Willard Beach,KwaZulu-Natal,-29.5265,31.2232,beach,Shad / Elf;Kob;Pompano;Blacktail,Surf beach and sandbank edges,Use public beach parking
+KZN North Coast,Ballito,Ballito Tidal Pool Edge,KwaZulu-Natal,-29.53815,31.21895,gully,Blacktail;Bronze Bream;Shad / Elf;Kob;Pompano,Rock/sand edge near tidal pool area,Use public beach parking
+KZN North Coast,Salt Rock,Salt Rock Main Beach,KwaZulu-Natal,-29.501,31.242,beach,Shad / Elf;Kob;Pompano;Blacktail,Beach gutters and rocky edges,Use public beach parking
+KZN North Coast,Tinley Manor,Tinley Manor Beach,KwaZulu-Natal,-29.439,31.284,beach,Kob;Shad / Elf;Pompano;Grey Shark,Open surf beach with sandbanks,Use public access only
+Durban / Umhlanga,Umhlanga,Umhlanga Lighthouse Gully,KwaZulu-Natal,-29.71782,31.08942,gully,Kob;Garrick / Leervis;Shad / Elf;Blacktail;Bronze Bream;Kingfish,Rocky gully near lighthouse,Use promenade parking
+Durban / Umhlanga,Umhlanga,Bronze Beach Gully Section,KwaZulu-Natal,-29.7139,31.092,white water,Shad / Elf;Kob;Garrick / Leervis;Pompano;Grey Shark,Sandbank drop-off with working white water,Use legal beach/promenade access
+Durban / Umhlanga,Umhlanga,Umhlanga Lagoon Mouth,KwaZulu-Natal,-29.7205,31.088,river mouth,Garrick / Leervis;Kob;Spotted Grunter;Shad / Elf;Pompano,Lagoon mouth current seam,Use safe lagoon/beach access
+Durban / Umhlanga,Durban North,Virginia Beach,KwaZulu-Natal,-29.771,31.066,beach,Kob;Shad / Elf;Pompano;Grey Shark,Surf beach with gutters,Use public beach parking
+Durban / Umhlanga,Durban,Blue Lagoon / Umgeni Mouth,KwaZulu-Natal,-29.808,31.042,river mouth,Kob;Garrick / Leervis;Spotted Grunter;Shad / Elf,River mouth and current seam,Park legally; check safety and access
+Durban / Umhlanga,Durban,North Beach Piers,KwaZulu-Natal,-29.845,31.037,pier / beach,Shad / Elf;Kob;Pompano;Grey Shark,"Piers, gutters and surf structure",Use beachfront parking; obey pier rules
+Durban / Umhlanga,Durban,Addington Beach,KwaZulu-Natal,-29.865,31.045,beach,Shad / Elf;Kob;Pompano,Protected surf beach and pier edges,Use beachfront parking
+Durban / Umhlanga,Bluff,Ansteys Beach,KwaZulu-Natal,-29.923,31.003,beach / rocks,Kob;Shad / Elf;Blacktail;Bronze Bream,Rocky beach and gullies,Use public parking; check safety
+Durban / Umhlanga,Bluff,Brighton Beach,KwaZulu-Natal,-29.94,30.992,beach / rocks,Kob;Shad / Elf;Grey Shark;Blacktail,Surf beach and rocky edges,Use public parking; avoid isolated areas
+KZN South Coast,Amanzimtoti,Toti River Mouth,KwaZulu-Natal,-30.052,30.89,river mouth,Kob;Spotted Grunter;Shad / Elf;Garrick / Leervis,"River mouth, sandbanks and surf seam",Use public beach access
+KZN South Coast,Scottburgh,Scottburgh Point,KwaZulu-Natal,-30.287,30.755,point / beach,Kob;Shad / Elf;Pompano;Grey Shark,"Point, tidal pool and surf gutters",Use public beach parking
+KZN South Coast,Umkomaas,Umkomaas River Mouth,KwaZulu-Natal,-30.206,30.8,river mouth,Kob;Spotted Grunter;Garrick / Leervis;Shad / Elf,Large river mouth and current edges,Use legal access; check river flow
+KZN South Coast,Hibberdene,Hibberdene Beach,KwaZulu-Natal,-30.573,30.573,beach,Kob;Shad / Elf;Pompano;Blacktail,Surf beach and rocky sections,Use public beach parking
+KZN South Coast,Margate,Margate Pier / Beach,KwaZulu-Natal,-30.863,30.37,pier / beach,Shad / Elf;Kob;Pompano;Grey Shark,Pier edges and surf gutters,Use public parking; obey local rules
+KZN South Coast,Ramsgate,Ramsgate Beach,KwaZulu-Natal,-30.887,30.348,beach / gully,Kob;Shad / Elf;Blacktail;Bronze Bream,Rock/sand edges and gutters,Use public beach parking
+KZN South Coast,Southbroom,Southbroom River-Mouth Channel,KwaZulu-Natal,-30.9192,30.3287,river mouth,Kob;Garrick / Leervis;Spotted Grunter;Pompano;Shad / Elf,River-mouth channel seam,Park near public access
+KZN South Coast,Trafalgar,Trafalgar Rock-Sand Transition,KwaZulu-Natal,-30.8339,30.4105,gully,Kob;Shad / Elf;Bronze Bream;Blacktail;Grey Shark,Rock and sand transition with feeding gully,Park at legal beach access
+KZN South Coast,Palm Beach,Palm Beach White-Water Channel,KwaZulu-Natal,-30.867,30.3823,white water,Shad / Elf;Kob;Garrick / Leervis;Bronze Bream;Blacktail;Pompano,Working white water with channel edge,Use public beach access
+KZN South Coast,Port Edward,Port Edward Rocky Point,KwaZulu-Natal,-31.0507,30.2264,gully / rocks,Kob;Shad / Elf;Bronze Bream;Blacktail;Grey Shark,Rocky point and gully water,Park at legal beach access
+Wild Coast,Port St Johns,First Beach,Eastern Cape,-31.6285,29.546,beach,Kob;Shad / Elf;Garrick / Leervis;Grey Shark,Surf beach near town and river influence,Use public beach parking; check safety
+Wild Coast,Port St Johns,Second Beach,Eastern Cape,-31.638,29.526,beach,Kob;Shad / Elf;Garrick / Leervis;Pompano,Surf beach with gutters and rocks,Use public access; check local safety
+Wild Coast,Port St Johns,Umzimvubu River Mouth,Eastern Cape,-31.6275,29.548,river mouth,Kob;Spotted Grunter;Garrick / Leervis;Shad / Elf,Large river mouth current seam,Park legally; beware strong currents
+Wild Coast,Port St Johns,Agate Terrace,Eastern Cape,-31.65,29.515,rocks / ledges,Kob;Shad / Elf;Bronze Bream;Grey Shark,Rocky ledges and deeper water,Use local access knowledge; high caution
+Wild Coast,Port St Johns,Poenskop,Eastern Cape,-31.666,29.488,rocks / point,Kob;Shad / Elf;Grey Shark;Bronze Bream,Rocky point and surf ledges,Use local guide/advice; dangerous in swell
+Wild Coast,Coffee Bay,Coffee Bay Main Beach,Eastern Cape,-31.985,29.151,beach,Kob;Shad / Elf;Garrick / Leervis;Pompano,Surf beach with sandbanks,Use public beach access
+Wild Coast,Coffee Bay,Hole in the Wall,Eastern Cape,-32.033,29.12,rocks / iconic point,Kob;Shad / Elf;Bronze Bream;Blacktail;Grey Shark,"Rocky ledges, deep water and white water",Use safe access; avoid big swell
+Wild Coast,Mdumbi,Mdumbi River Mouth,Eastern Cape,-31.945,29.21,river mouth,Kob;Spotted Grunter;Garrick / Leervis;Shad / Elf,River mouth and surf seam,Use legal/local access
+Wild Coast,Mbotyi,Mbotyi River Mouth,Eastern Cape,-31.458,29.725,river mouth,Kob;Garrick / Leervis;Spotted Grunter;Shad / Elf,"River mouth, rocks and surf gutters",Use resort/public access where legal
+Wild Coast,Kei Mouth,Kei Mouth River Mouth,Eastern Cape,-32.68,28.37,river mouth,Kob;Spotted Grunter;Garrick / Leervis;Shad / Elf,Kei River mouth and sandbanks,Use public access; beware currents
+Wild Coast,Morgan Bay,Morgan Bay Cliffs / Beach,Eastern Cape,-32.704,28.342,rocks / beach,Kob;Shad / Elf;Blacktail;Bronze Bream,"Cliffs, rocky ledges and surf beach",High caution near cliffs and swell
+Eastern Cape,East London,Nahoon Reef,Eastern Cape,-32.996,27.953,reef / beach,Kob;Shad / Elf;Blacktail;Bronze Bream,"Reef, beach gutters and white water",Use public parking; check swell
+Eastern Cape,East London,Gonubie River Mouth,Eastern Cape,-32.94,28.02,river mouth,Kob;Spotted Grunter;Garrick / Leervis;Shad / Elf,River mouth and surf seam,Use public beach/river access
+Eastern Cape,Kidds Beach,Kidds Beach,Eastern Cape,-33.154,27.694,beach,Kob;Shad / Elf;Pompano;Grey Shark,Long surf beach with gutters,Use public access
+Eastern Cape,Port Alfred,Kowie River Mouth,Eastern Cape,-33.592,26.895,river mouth,Kob;Spotted Grunter;Garrick / Leervis;Shad / Elf,"River mouth, harbour and surf edges",Use legal access
+Eastern Cape,Kenton-on-Sea,Bushmans River Mouth,Eastern Cape,-33.687,26.67,river mouth,Kob;Spotted Grunter;Garrick / Leervis,River mouth and sandbanks,Use public access
+Eastern Cape,Kenton-on-Sea,Kariega River Mouth,Eastern Cape,-33.682,26.672,river mouth,Kob;Spotted Grunter;Garrick / Leervis,River mouth and channels,Use public access
+Eastern Cape,Jeffreys Bay,Main Beach / Point,Eastern Cape,-34.051,24.921,beach / point,Kob;Shad / Elf;Pompano;Grey Shark,Surf beach and point structure,Use public beach parking
+Eastern Cape,St Francis Bay,Kromme River Mouth,Eastern Cape,-34.165,24.838,river mouth,Kob;Spotted Grunter;Garrick / Leervis,River mouth and sandbanks,Use legal access
+Eastern Cape,Port Elizabeth / Gqeberha,Swartkops River Mouth,Eastern Cape,-33.865,25.633,river mouth,Kob;Spotted Grunter;Garrick / Leervis,River mouth and estuary channels,Use public access; check safety
+Eastern Cape,Port Elizabeth / Gqeberha,Sardinia Bay,Eastern Cape,-34.029,25.505,beach,Kob;Shad / Elf;Grey Shark;Pompano,"Long beach, gutters and sandbanks",Use public parking; 4x4/access rules may apply
+Garden Route,Tsitsikamma,Storms River Mouth,Eastern Cape,-34.023,23.897,river mouth / rocks,Blacktail;Bronze Bream;Galjoen,Rocky coast and river mouth,Check park/MPA rules before fishing
+Garden Route,Nature's Valley,Nature's Valley Lagoon Mouth,Western Cape,-33.98,23.56,lagoon mouth,Kob;Garrick / Leervis;Blacktail;Bronze Bream,Lagoon mouth and surf beach,Check park rules and access
+Garden Route,Plettenberg Bay,Keurbooms River Mouth,Western Cape,-34.005,23.402,river mouth,Kob;Spotted Grunter;Garrick / Leervis,"River mouth, channels and sandbanks",Use public parking/access
+Garden Route,Plettenberg Bay,Robberg Beach,Western Cape,-34.073,23.371,beach,Kob;Shad / Elf;White Steenbras;Grey Shark,Long surf beach with banks,Use public beach parking
+Garden Route,Knysna,Knysna Heads,Western Cape,-34.074,23.062,heads / rocks,Kob;Blacktail;Bronze Bream;Spotted Grunter,Tidal channel and rocky edges,High caution; check access and rules
+Garden Route,Sedgefield,Swartvlei Mouth,Western Cape,-34.028,22.808,estuary mouth,Kob;Spotted Grunter;Garrick / Leervis,Estuary mouth and sandbanks,Use public access
+Garden Route,Wilderness,Touw River Mouth,Western Cape,-33.996,22.577,river mouth,Kob;Spotted Grunter;White Steenbras,River mouth and surf seam,Use public access
+Garden Route,Mossel Bay,Santos Beach,Western Cape,-34.181,22.144,beach,Kob;Shad / Elf;White Steenbras;Blacktail,Protected beach and harbour edges,Use public parking
+Garden Route,Mossel Bay,The Point,Western Cape,-34.183,22.164,rocks / point,Blacktail;Bronze Bream;Galjoen;Kob,"Rocky point, gullies and white water",Use public parking; check swell
+Cape South Coast,Witsand,Breede River Mouth,Western Cape,-34.397,20.838,river mouth,Kob;Spotted Grunter;White Steenbras;Garrick / Leervis,Large river mouth and sandbanks,Use public access; strong currents
+Cape South Coast,Arniston,Arniston Beach,Western Cape,-34.667,20.23,beach / rocks,Galjoen;Blacktail;Bronze Bream;Kob,Rock/sand edges and surf gutters,Use legal access
+Cape South Coast,Struisbaai,Struisbaai Beach,Western Cape,-34.801,20.045,beach,Kob;White Steenbras;Galjoen;Blacktail,Long beach with sandbanks,Use public parking
+Cape South Coast,Agulhas,Agulhas Rocks,Western Cape,-34.833,20.005,rocks,Galjoen;Blacktail;Bronze Bream;Kob,Rocky shoreline and gullies,Use safe rock access; check swell
+Cape South Coast,Hermanus,Klein River Mouth,Western Cape,-34.42,19.295,lagoon mouth,Kob;White Steenbras;Spotted Grunter,Lagoon mouth and surf seam,Use public access
+Cape South Coast,Gansbaai,Gansbaai Harbour / Coast,Western Cape,-34.585,19.351,harbour / rocks,Galjoen;Blacktail;Kob;Bronze Bream,Harbour edges and rocky coast,Check harbour and access rules
+Cape Peninsula,Muizenberg,Muizenberg Beach,Western Cape,-34.108,18.47,beach,Kob;White Steenbras;Galjoen;Shad / Elf,Long surf beach and sandbanks,Use public beach parking
+Cape Peninsula,Strandfontein,Strandfontein Pavilion,Western Cape,-34.082,18.556,beach,Kob;White Steenbras;Galjoen;Grey Shark,"Surf beach, gutters and banks",Use public parking; check safety
+Cape Peninsula,Macassar,Macassar Beach,Western Cape,-34.07,18.75,beach,Kob;White Steenbras;Grey Shark;Galjoen,Long surf beach with banks,Use legal access; safety caution
+Cape Peninsula,Gordon's Bay,Harbour Island / Beach,Western Cape,-34.165,18.856,harbour / beach,Kob;Galjoen;Blacktail,Harbour edges and beach water,Check access restrictions
+Cape Peninsula,Fish Hoek,Fish Hoek Beach,Western Cape,-34.136,18.432,beach,Kob;Galjoen;White Steenbras,Beach and bay structure,Use public beach parking
+Cape Peninsula,Simonstown,Long Beach,Western Cape,-34.19,18.43,beach,Kob;Galjoen;Blacktail,Protected beach and rocky edges,Use public parking
+Cape Peninsula,Kommetjie,Kommetjie Rocks,Western Cape,-34.138,18.32,rocks,Galjoen;Blacktail;Bronze Bream,Rocky ledges and white water,High caution in swell
+Cape Peninsula,Hout Bay,Hout Bay Harbour / Beach,Western Cape,-34.048,18.348,harbour / beach,Kob;Galjoen;Blacktail,Harbour wall and beach edges,Check harbour rules
+West Coast,Melkbosstrand,Melkbosstrand Beach,Western Cape,-33.727,18.445,beach,Kob;Galjoen;White Steenbras,Long surf beach and gutters,Use public beach parking
+West Coast,Yzerfontein,Yzerfontein Main Beach,Western Cape,-33.344,18.16,beach,Galjoen;Kob;White Steenbras,Surf beach and rocky edges,Use public parking
+West Coast,Langebaan,Langebaan Lagoon,Western Cape,-33.094,18.032,lagoon,White Steenbras;Spotted Grunter;Elf / Shad,Lagoon channels and sandbanks,Check West Coast National Park rules
+West Coast,Saldanha,Saldanha Bay,Western Cape,-33.011,17.944,bay / harbour,Kob;Galjoen;White Steenbras,"Bay, harbour and beach edges",Check harbour/access rules
+West Coast,Paternoster,Paternoster Rocks,Western Cape,-32.81,17.891,rocks / beach,Galjoen;Blacktail;Kob,Rocky gullies and beaches,Use safe access; check swell
+West Coast,Elands Bay,Elands Bay Beach,Western Cape,-32.315,18.333,beach,Galjoen;Kob;White Steenbras,Surf beach and rocky areas,Use public access
+West Coast,Doringbaai,Doringbaai Harbour,Western Cape,-31.817,18.232,harbour / rocks,Galjoen;Blacktail;Kob,Harbour wall and rocky water,Check access and swell
+West Coast,Port Nolloth,Port Nolloth Beach / Harbour,Northern Cape,-29.252,16.869,harbour / beach,Galjoen;Kob;Blacktail,Cold-water beach and harbour edges,Check local access and safety
