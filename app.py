@@ -534,6 +534,9 @@ def load_local_fishing_spots() -> pd.DataFrame:
 
     try:
         df = pd.read_csv(LOCAL_SPOTS_CSV)
+        st.sidebar.write("CSV found:", os.path.exists(LOCAL_SPOTS_CSV))
+st.sidebar.write("CSV rows:", len(df))
+st.sidebar.write("CSV columns:", list(df.columns))
         df.columns = df.columns.str.strip().str.lower())
         required = {"region", "area", "spot_name", "province", "lat", "lon", "spot_type", "main_species", "structure", "parking_note"}
         missing = required - set(df.columns)
