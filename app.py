@@ -518,7 +518,7 @@ def profile_for_area(area: str, lat: float, lon: float) -> Dict[str, float]:
 # Local CSV fishing nodes
 # =====================================================
 
-LOCAL_SPOTS_CSV = os.path.join("data", "sa_fishing_spots.csv")
+LOCAL_SPOTS_CSV = "sa_fishing_spots.csv"
 
 
 @st.cache_data(ttl=7200)
