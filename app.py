@@ -70,6 +70,44 @@ STORMGLASS_API_KEY = get_secret_safe("STORMGLASS_API_KEY", "")
 
 
 # =====================================================
+# Asset resolver — works on GitHub root, /assets, /images and local folders
+# =====================================================
+
+def find_asset(filename: str) -> Optional[str]:
+    """Find an image/file whether uploaded to repo root, assets/, images/ or data/."""
+    if not filename:
+        return None
+    base = os.path.basename(str(filename))
+    candidates = []
+    # keep original first, then common GitHub/Streamlit layouts
+    for item in [filename, base, os.path.join("assets", base), os.path.join("images", base), os.path.join("data", base)]:
+        if item not in candidates:
+            candidates.append(item)
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+TRACE_IMAGE_MAP = {
+    "kob": "kob_trace.png",
+    "shad / elf": "shad_trace.png",
+    "garrick / leervis": "garrick_trace.png",
+    "bronze bream": "bronze_bream_trace.png",
+    "blacktail": "blacktail_trace.png",
+    "spotted grunter": "grunter_trace.png",
+    "pompano": "pompano_trace.png",
+    "kingfish": "kingfish_trace.png",
+    "grey shark": "grey_shark_trace.png",
+    "sand shark": "sand_shark_trace.png",
+}
+
+def trace_image_for_species(species_name: str) -> Optional[str]:
+    key = str(species_name or "").strip().lower()
+    filename = TRACE_IMAGE_MAP.get(key)
+    return find_asset(filename) if filename else None
+
+
+# =====================================================
 # Utilities
 # =====================================================
 
@@ -654,7 +692,9 @@ COORDINATE_OVERRIDES = {
 }
 
 def coordinate_override_for(area: str, spot_name: str):
-    return COORDINATE_OVERRIDES.get(f"{str(area).strip().lower()}|{str(spot_name).strip().lower()}")
+    # Disabled for production: exact CSV calibration must win.
+    # Hardcoded overrides caused wrong markers when deployed/GitHub data differed.
+    return None
 
 def _is_real_number(value) -> bool:
     try:
@@ -1050,17 +1090,14 @@ def local_csv_spots_for_ranking(planning_point: Tuple[float, float], radius_km: 
             geometry_source = calibrated_points["source"]
         else:
             # Coordinate-first fallback:
-            # Use the CSV lat/lon as the standing/shoreline anchor, then cast seaward.
-            # For Durban/Umhlanga rough anchors, shift closer to the beach before casting.
+            # Use the CSV lat/lon exactly as the standing / spot anchor.
+            # Do NOT push it into the sea. Cast is projected seaward from that anchor.
             profile = profile_for_area(str(row["area"]), point[0], point[1])
-            region_text = f"{row['region']} {row['area']} {row['spot_name']}".lower()
-            if "umhlanga" in region_text or "durban north" in region_text or "virginia" in region_text:
-                stand_point = destination_point(point, profile["sea"], 220)
-            else:
-                stand_point = point
-            cast_point = auto_cast_from_stand(str(row["area"]), stand_point, 70, land_anchor=planning_point)
-            parking_point = destination_point(stand_point, profile["land"], 400)
-            geometry_source = "CSV shoreline anchor + cast-distance geometry; calibrate only to fine-tune"
+            stand_point = point
+            sea_bearing = expected_sea_bearing_for_spot(str(row["area"]), stand_point)
+            cast_point = destination_point(stand_point, sea_bearing, 70)
+            parking_point = destination_point(stand_point, opposite_bearing(sea_bearing), 400)
+            geometry_source = "CSV exact anchor + simple seaward cast; use Calibration tab to fine-tune"
 
         spot_record = {
             "area": str(row["area"]),
@@ -2616,7 +2653,7 @@ with tabs[1]:
     )
 
     if folium and st_folium:
-        center = ((parking[0] + cast[0]) / 2, (parking[1] + cast[1]) / 2)
+        center = ((stand[0] + cast[0]) / 2, (stand[1] + cast[1]) / 2)
         m = folium.Map(location=center, zoom_start=16, tiles=None)
         folium.TileLayer(
             tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -2748,6 +2785,12 @@ with tabs[4]:
     st.write(f"**Trace:** {species['trace']}")
     st.code(species["trace_diagram"])
 
+    trace_img = trace_image_for_species(fish)
+    if trace_img:
+        st.image(trace_img, caption=f"{fish} trace setup", width="stretch")
+    else:
+        st.caption(f"Trace image not found for {fish}. Upload it to repo root, assets/, or images/.")
+
     st.subheader("Bite behaviour")
     st.write(f"**Bite style:** {species['bite_style']}")
     st.write(f"**Feel:** {species['feel']}")
@@ -2782,10 +2825,11 @@ with tabs[6]:
 
     def package_card(image_path, title, persona, price, description, features, button_label):
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
-        if os.path.exists(image_path):
-            st.image(image_path, width="stretch")
+        resolved_image = find_asset(image_path)
+        if resolved_image:
+            st.image(resolved_image, width="stretch")
         else:
-            st.info(f"Add image: {image_path}")
+            st.info(f"Add image: {image_path} (root, assets/ or images/)")
         st.subheader(title)
         st.caption(persona)
         st.markdown(f"### {price}")
@@ -2941,13 +2985,13 @@ with tabs[8]:
     b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("Auto-cast from stand", width="stretch"):
-            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 70, land_anchor=(parking_lat, parking_lon))
+            new_cast = destination_point((stand_lat, stand_lon), expected_sea_bearing_for_spot(area, (stand_lat, stand_lon)), 70)
             st.session_state["cal_cast_lat"] = float(new_cast[0])
             st.session_state["cal_cast_lon"] = float(new_cast[1])
             st.rerun()
     with b2:
         if st.button("Move cast to 90m", width="stretch"):
-            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 90, land_anchor=(parking_lat, parking_lon))
+            new_cast = destination_point((stand_lat, stand_lon), expected_sea_bearing_for_spot(area, (stand_lat, stand_lon)), 90)
             st.session_state["cal_cast_lat"] = float(new_cast[0])
             st.session_state["cal_cast_lon"] = float(new_cast[1])
             st.rerun()
@@ -3016,7 +3060,7 @@ with tabs[8]:
                 st.session_state["cal_stand_lat"] = float(exact_stand[0])
                 st.session_state["cal_stand_lon"] = float(exact_stand[1])
                 # Auto-place cast into surf from that stand; user can then click Cast target if needed.
-                new_cast = auto_cast_from_stand(area, exact_stand, 70, land_anchor=(parking_lat, parking_lon))
+                new_cast = destination_point(exact_stand, expected_sea_bearing_for_spot(area, exact_stand), 70)
                 st.session_state["cal_cast_lat"] = float(new_cast[0])
                 st.session_state["cal_cast_lon"] = float(new_cast[1])
             elif action == "Cast target":
