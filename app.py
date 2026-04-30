@@ -518,35 +518,89 @@ def profile_for_area(area: str, lat: float, lon: float) -> Dict[str, float]:
 # Local CSV fishing nodes
 # =====================================================
 
-LOCAL_SPOTS_CSV = "sa_fishing_spots.csv"
+def resolve_spots_csv_path() -> str:
+    """Return CSV path that works on GitHub/Streamlit Cloud and local laptop.
+    Priority:
+    1) sa_fishing_spots.csv in the same folder as app.py (GitHub root)
+    2) data/sa_fishing_spots.csv (local package structure)
+    3) fallback to root filename for new saves
+    """
+    root_csv = "sa_fishing_spots.csv"
+    data_csv = os.path.join("data", "sa_fishing_spots.csv")
+    if os.path.exists(root_csv):
+        return root_csv
+    if os.path.exists(data_csv):
+        return data_csv
+    return root_csv
+
+
+LOCAL_SPOTS_CSV = resolve_spots_csv_path()
 
 
 @st.cache_data(ttl=7200)
 def load_local_fishing_spots() -> pd.DataFrame:
     """
-    Loads curated South African fishing nodes from:
-    data/sa_fishing_spots.csv
+    Loads curated South African fishing nodes from either:
+    - sa_fishing_spots.csv, or
+    - data/sa_fishing_spots.csv
 
-    This is faster and more accurate than relying only on internet search.
+    This loader is tolerant so the app works on laptop, GitHub and mobile/deployed use.
+    It will not kill the dataset just because optional columns are missing.
     """
-    if not os.path.exists(LOCAL_SPOTS_CSV):
+    csv_path = resolve_spots_csv_path()
+    if not os.path.exists(csv_path):
+        st.sidebar.warning(f"Fishing spots CSV not found. Expected: sa_fishing_spots.csv or data/sa_fishing_spots.csv")
         return pd.DataFrame()
 
     try:
-        df = pd.read_csv(LOCAL_SPOTS_CSV)
-        st.sidebar.write("CSV found:", os.path.exists(LOCAL_SPOTS_CSV))
-st.sidebar.write("CSV rows:", len(df))
-st.sidebar.write("CSV columns:", list(df.columns))
-        df.columns = df.columns.str.strip().str.lower())
+        df = pd.read_csv(csv_path)
+        df.columns = df.columns.astype(str).str.strip().str.lower()
+
+        # Common column aliases from manual CSV edits / Excel exports
+        aliases = {
+            "latitude": "lat",
+            "longitude": "lon",
+            "lng": "lon",
+            "long": "lon",
+            "spot": "spot_name",
+            "name": "spot_name",
+            "species": "main_species",
+            "target_species": "main_species",
+            "type": "spot_type",
+            "province_name": "province",
+        }
+        df = df.rename(columns={c: aliases.get(c, c) for c in df.columns})
+
         required = {"region", "area", "spot_name", "province", "lat", "lon", "spot_type", "main_species", "structure", "parking_note"}
         missing = required - set(df.columns)
-        if missing:
-            st.sidebar.warning(f"Fishing spots CSV missing columns: {', '.join(sorted(missing))}")
+
+        # Do NOT return an empty dataframe for optional/missing columns. Fill sensible defaults.
+        for col in missing:
+            if col in ["region", "province"]:
+                df[col] = "South Africa"
+            elif col == "spot_type":
+                df[col] = "coastal"
+            elif col == "main_species":
+                df[col] = "Kob; Shad / Elf"
+            elif col == "structure":
+                df[col] = "Coastal fishing structure"
+            elif col == "parking_note":
+                df[col] = "Use nearest safe/legal parking and navigate to standing spot."
+            else:
+                df[col] = ""
+
+        if "lat" not in df.columns or "lon" not in df.columns:
+            st.sidebar.warning("CSV must contain lat/lon or latitude/longitude columns.")
             return pd.DataFrame()
 
         df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
         df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
         df = df.dropna(subset=["lat", "lon"])
+
+        # Normalise key text columns
+        for col in ["region", "area", "spot_name", "province", "spot_type", "main_species", "structure", "parking_note"]:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
         return df
     except Exception as e:
         st.sidebar.warning(f"Could not load local fishing spots CSV: {e}")
@@ -618,10 +672,14 @@ def row_has_calibrated_points(row: Any) -> bool:
     return all(_is_real_number(row.get(c, None)) for c in ["stand_lat", "stand_lon", "cast_lat", "cast_lon"])
 
 def row_get_calibrated_points(row: Any) -> Dict[str, Any]:
+    """Return exact manually calibrated coordinates from CSV.
+
+    Do not auto-clean a manually clicked cast target. If the user calibrated
+    the stand and cast point, the map must honour those exact coordinates.
+    Auto-cast is only for missing cast targets.
+    """
     stand = (float(row["stand_lat"]), float(row["stand_lon"]))
-    raw_cast = (float(row["cast_lat"]), float(row["cast_lon"]))
-    area_name = str(row.get("area", ""))
-    cast = cast_for_display(area_name, stand, raw_cast)
+    cast = (float(row["cast_lat"]), float(row["cast_lon"]))
     if _is_real_number(row.get("parking_lat", None)) and _is_real_number(row.get("parking_lon", None)):
         parking = (float(row["parking_lat"]), float(row["parking_lon"]))
     else:
@@ -632,32 +690,39 @@ def row_get_calibrated_points(row: Any) -> Dict[str, Any]:
         "cast": cast,
         "cast_distance_m": distance_m(stand, cast),
         "cast_bearing": calculate_bearing(stand, cast),
-        "source": "Exact calibrated CSV coordinates",
+        "source": "Exact manual calibrated CSV coordinates",
     }
 
 def google_maps_url(lat: float, lon: float, mode: str = "walking") -> str:
     return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode={mode}"
 
 def save_calibration_to_csv(area: str, spot_name: str, values: Dict[str, Any]) -> Tuple[bool, str]:
-    if not os.path.exists(LOCAL_SPOTS_CSV):
-        return False, f"CSV not found at {LOCAL_SPOTS_CSV}"
+    csv_path = resolve_spots_csv_path()
+    if not os.path.exists(csv_path):
+        return False, f"CSV not found. Expected sa_fishing_spots.csv or data/sa_fishing_spots.csv"
 
-    df = pd.read_csv(LOCAL_SPOTS_CSV)
-    for col in CALIBRATION_COLUMNS:
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.astype(str).str.strip().str.lower()
+
+    # Ensure key and calibration columns exist
+    for col in ["area", "spot_name"] + CALIBRATION_COLUMNS:
         if col not in df.columns:
             df[col] = ""
 
-    mask = (df["area"].astype(str) == str(area)) & (df["spot_name"].astype(str) == str(spot_name))
+    mask = (df["area"].astype(str).str.strip().str.lower() == str(area).strip().lower()) & (
+        df["spot_name"].astype(str).str.strip().str.lower() == str(spot_name).strip().lower()
+    )
     if not mask.any():
         return False, f"Could not find CSV row for {area} - {spot_name}"
 
     idx = df.index[mask][0]
     for key, val in values.items():
+        key = str(key).strip().lower()
         if key in df.columns:
             df.at[idx, key] = val
 
     df.at[idx, "calibrated_at"] = datetime.now().isoformat(timespec="seconds")
-    df.to_csv(LOCAL_SPOTS_CSV, index=False)
+    df.to_csv(csv_path, index=False)
     st.cache_data.clear()
     return True, f"Saved calibration for {area} - {spot_name}"
 
@@ -761,6 +826,16 @@ def cast_for_display(area_name: str, stand: Tuple[float, float], stored_cast: Tu
     return get_perpendicular_cast(area_name, stand, d, stored_cast)
 
 
+def display_cast_for_loaded(loaded: Dict[str, Any]) -> Tuple[float, float]:
+    """Use exact calibrated cast when available; otherwise use cleaned auto-cast for display."""
+    stand = loaded.get("stand")
+    cast = loaded.get("cast")
+    src = str(loaded.get("spot", {}).get("geometry_source", "") or loaded.get("coast_meta", {}).get("coast_source", "")).lower()
+    if "exact manual calibrated" in src or "exact calibrated" in src:
+        return cast
+    return cast_for_display(loaded["spot"].get("area", ""), stand, cast)
+
+
 def bearing_delta(a: float, b: float) -> float:
     return abs((a - b + 180) % 360 - 180)
 
@@ -816,9 +891,28 @@ def validate_calibrated_geometry(
     return len(errors) == 0, errors, warnings
 
 
-def auto_cast_from_stand(area_name: str, stand: Tuple[float, float], distance_meters: float = 70) -> Tuple[float, float]:
-    return fixed_cast_from_stand(area_name, stand, distance_meters)
+def sea_bearing_from_land_anchor(stand: Tuple[float, float], land_anchor: Optional[Tuple[float, float]] = None, area_name: str = "") -> float:
+    """Auto-cast bearing only. Manual cast clicks stay exact.
 
+    If a land/parking/planning anchor is known, cast away from that anchor
+    through the standing point. Otherwise use the area profile.
+    """
+    if land_anchor:
+        try:
+            b = calculate_bearing(land_anchor, stand)
+            area_text = str(area_name or "").lower()
+            if any(x in area_text for x in ["umhlanga", "durban", "ballito", "virginia", "leisure", "port edward", "port st johns", "wild coast"]):
+                if not (35 <= b <= 160):
+                    return expected_sea_bearing_for_spot(area_name, stand)
+            return b
+        except Exception:
+            pass
+    return expected_sea_bearing_for_spot(area_name, stand)
+
+
+def auto_cast_from_stand(area_name: str, stand: Tuple[float, float], distance_meters: float = 70, land_anchor: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
+    bearing = sea_bearing_from_land_anchor(stand, land_anchor=land_anchor, area_name=area_name)
+    return destination_point(stand, bearing, distance_meters)
 
 def snap_stand_click_for_east_coast(area_name: str, clicked: Tuple[float, float]) -> Tuple[float, float]:
     """
@@ -946,7 +1040,7 @@ def local_csv_spots_for_ranking(planning_point: Tuple[float, float], radius_km: 
             parking_point = override["parking"]
             stand_point = override["stand"]
             cast_point = cast_for_display(str(row["area"]), stand_point, override["cast"])
-            geometry_source = override["source"] + " | cast fixed east from stand"
+            geometry_source = override["source"] + " | auto cast shoreline-oriented"
             calibrated = True
         elif calibrated:
             calibrated_points = row_get_calibrated_points(row)
@@ -964,7 +1058,7 @@ def local_csv_spots_for_ranking(planning_point: Tuple[float, float], radius_km: 
                 stand_point = destination_point(point, profile["sea"], 220)
             else:
                 stand_point = point
-            cast_point = auto_cast_from_stand(str(row["area"]), stand_point, 70)
+            cast_point = auto_cast_from_stand(str(row["area"]), stand_point, 70, land_anchor=planning_point)
             parking_point = destination_point(stand_point, profile["land"], 400)
             geometry_source = "CSV shoreline anchor + cast-distance geometry; calibrate only to fine-tune"
 
@@ -2474,7 +2568,7 @@ with tabs[0]:
         st.write(f"**Conditions score:** {loaded['condition_score']}%")
         st.write(f"**Spot potential:** {loaded['score_detail']['raw_spot_potential']}%")
 
-    display_cast = cast_for_display(loaded["spot"].get("area", ""), loaded["stand"], loaded["cast"])
+    display_cast = display_cast_for_loaded(loaded)
     bearing = calculate_bearing(loaded["stand"], display_cast)
     compass = bearing_to_compass(bearing)
     cast_distance = distance_m(loaded["stand"], display_cast)
@@ -2494,7 +2588,7 @@ with tabs[1]:
     selected_name = get_loaded_key_from_label(st.session_state.selected_option_label)
     loaded = detailed[selected_name]
     parking, stand, cast = loaded["parking"], loaded["stand"], loaded["cast"]
-    cast = cast_for_display(loaded["spot"].get("area", ""), stand, cast)
+    cast = display_cast_for_loaded(loaded)
     access_point = loaded["coast_meta"].get("access_point")
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
@@ -2559,7 +2653,7 @@ with tabs[2]:
     selected_name = st.session_state.selected_option_label.split(" — ")[0]
     loaded = detailed[selected_name]
     stand, cast = loaded["stand"], loaded["cast"]
-    cast = cast_for_display(loaded["spot"].get("area", ""), stand, cast)
+    cast = display_cast_for_loaded(loaded)
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
     cast_distance = distance_m(stand, cast)
@@ -2847,13 +2941,13 @@ with tabs[8]:
     b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("Auto-cast from stand", width="stretch"):
-            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 70)
+            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 70, land_anchor=(parking_lat, parking_lon))
             st.session_state["cal_cast_lat"] = float(new_cast[0])
             st.session_state["cal_cast_lon"] = float(new_cast[1])
             st.rerun()
     with b2:
         if st.button("Move cast to 90m", width="stretch"):
-            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 90)
+            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 90, land_anchor=(parking_lat, parking_lon))
             st.session_state["cal_cast_lat"] = float(new_cast[0])
             st.session_state["cal_cast_lon"] = float(new_cast[1])
             st.rerun()
@@ -2922,7 +3016,7 @@ with tabs[8]:
                 st.session_state["cal_stand_lat"] = float(exact_stand[0])
                 st.session_state["cal_stand_lon"] = float(exact_stand[1])
                 # Auto-place cast into surf from that stand; user can then click Cast target if needed.
-                new_cast = auto_cast_from_stand(area, exact_stand, 70)
+                new_cast = auto_cast_from_stand(area, exact_stand, 70, land_anchor=(parking_lat, parking_lon))
                 st.session_state["cal_cast_lat"] = float(new_cast[0])
                 st.session_state["cal_cast_lon"] = float(new_cast[1])
             elif action == "Cast target":
