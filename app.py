@@ -26,7 +26,7 @@ except Exception:
 
 
 # =====================================================
-# CastIQ Pro — corrected full app.py
+# CastIQ Pro — latest enhanced app.py
 # Key upgrades:
 # - Safe secrets handling: no StreamlitSecretNotFoundError
 # - SA-wide location search using OpenStreetMap Nominatim
@@ -513,6 +513,483 @@ def profile_for_area(area: str, lat: float, lon: float) -> Dict[str, float]:
     return COAST_PROFILES["default_wc"]
 
 
+
+# =====================================================
+# Local CSV fishing nodes
+# =====================================================
+
+LOCAL_SPOTS_CSV = os.path.join("data", "sa_fishing_spots.csv")
+
+
+@st.cache_data(ttl=7200)
+def load_local_fishing_spots() -> pd.DataFrame:
+    """
+    Loads curated South African fishing nodes from:
+    data/sa_fishing_spots.csv
+
+    This is faster and more accurate than relying only on internet search.
+    """
+    if not os.path.exists(LOCAL_SPOTS_CSV):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(LOCAL_SPOTS_CSV)
+        required = {"region", "area", "spot_name", "province", "lat", "lon", "spot_type", "main_species", "structure", "parking_note"}
+        missing = required - set(df.columns)
+        if missing:
+            st.sidebar.warning(f"Fishing spots CSV missing columns: {', '.join(sorted(missing))}")
+            return pd.DataFrame()
+
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        df = df.dropna(subset=["lat", "lon"])
+        return df
+    except Exception as e:
+        st.sidebar.warning(f"Could not load local fishing spots CSV: {e}")
+        return pd.DataFrame()
+
+
+
+# =====================================================
+# Coordinate-first calibration helpers
+# =====================================================
+
+CALIBRATION_COLUMNS = [
+    "parking_lat", "parking_lon",
+    "stand_lat", "stand_lon",
+    "cast_lat", "cast_lon",
+    "cast_distance_m", "cast_bearing",
+    "calibration_note", "calibrated_at",
+]
+
+
+# =====================================================
+# Hard coordinate overrides for known high-use beach spots
+# These stop the app from using rough town/spot anchors that land on buildings.
+# Format: (parking, stand, cast). Parking is general access only; stand/cast drive the fishing map.
+# =====================================================
+COORDINATE_OVERRIDES = {
+    "umhlanga|umhlanga lighthouse gully": {
+        "parking": (-29.71835, 31.08795),
+        "stand": (-29.71805, 31.09120),
+        "cast": (-29.71792, 31.09195),
+        "source": "Hard curated shoreline coordinates — Umhlanga Lighthouse",
+    },
+    "umhlanga|bronze beach gully section": {
+        "parking": (-29.71380, 31.09010),
+        "stand": (-29.71378, 31.09320),
+        "cast": (-29.71362, 31.09395),
+        "source": "Hard curated shoreline coordinates — Bronze Beach",
+    },
+    "umhlanga|umhlanga lagoon mouth": {
+        "parking": (-29.72120, 31.08690),
+        "stand": (-29.72070, 31.08970),
+        "cast": (-29.72055, 31.09045),
+        "source": "Hard curated shoreline coordinates — Umhlanga Lagoon Mouth",
+    },
+    "durban north|virginia beach": {
+        "parking": (-29.77120, 31.06490),
+        "stand": (-29.77145, 31.06845),
+        "cast": (-29.77125, 31.06920),
+        "source": "Hard curated shoreline coordinates — Virginia Beach",
+    },
+}
+
+def coordinate_override_for(area: str, spot_name: str):
+    return COORDINATE_OVERRIDES.get(f"{str(area).strip().lower()}|{str(spot_name).strip().lower()}")
+
+def _is_real_number(value) -> bool:
+    try:
+        if value is None:
+            return False
+        text = str(value).strip().lower()
+        if text in ["", "nan", "none", "null"]:
+            return False
+        float(text)
+        return True
+    except Exception:
+        return False
+
+def row_has_calibrated_points(row: Any) -> bool:
+    return all(_is_real_number(row.get(c, None)) for c in ["stand_lat", "stand_lon", "cast_lat", "cast_lon"])
+
+def row_get_calibrated_points(row: Any) -> Dict[str, Any]:
+    stand = (float(row["stand_lat"]), float(row["stand_lon"]))
+    raw_cast = (float(row["cast_lat"]), float(row["cast_lon"]))
+    area_name = str(row.get("area", ""))
+    cast = cast_for_display(area_name, stand, raw_cast)
+    if _is_real_number(row.get("parking_lat", None)) and _is_real_number(row.get("parking_lon", None)):
+        parking = (float(row["parking_lat"]), float(row["parking_lon"]))
+    else:
+        parking = stand
+    return {
+        "parking": parking,
+        "stand": stand,
+        "cast": cast,
+        "cast_distance_m": distance_m(stand, cast),
+        "cast_bearing": calculate_bearing(stand, cast),
+        "source": "Exact calibrated CSV coordinates",
+    }
+
+def google_maps_url(lat: float, lon: float, mode: str = "walking") -> str:
+    return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode={mode}"
+
+def save_calibration_to_csv(area: str, spot_name: str, values: Dict[str, Any]) -> Tuple[bool, str]:
+    if not os.path.exists(LOCAL_SPOTS_CSV):
+        return False, f"CSV not found at {LOCAL_SPOTS_CSV}"
+
+    df = pd.read_csv(LOCAL_SPOTS_CSV)
+    for col in CALIBRATION_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    mask = (df["area"].astype(str) == str(area)) & (df["spot_name"].astype(str) == str(spot_name))
+    if not mask.any():
+        return False, f"Could not find CSV row for {area} - {spot_name}"
+
+    idx = df.index[mask][0]
+    for key, val in values.items():
+        if key in df.columns:
+            df.at[idx, key] = val
+
+    df.at[idx, "calibrated_at"] = datetime.now().isoformat(timespec="seconds")
+    df.to_csv(LOCAL_SPOTS_CSV, index=False)
+    st.cache_data.clear()
+    return True, f"Saved calibration for {area} - {spot_name}"
+
+
+
+# =====================================================
+# Calibration validation + shoreline-oriented cast engine
+# =====================================================
+
+def expected_sea_bearing_for_spot(area_name: str, stand: Tuple[float, float]) -> float:
+    """
+    Stable South African surf-cast bearing by local coastline orientation.
+
+    This deliberately avoids using parking/planning -> stand bearing because that
+    causes sideways lines. The app treats the standing point as authoritative and
+    projects the cast from that point into the surf using the local shoreline angle.
+    """
+    area_text = str(area_name or "").lower()
+    lat, lon = stand
+
+    # KZN north / Durban / Umhlanga coastline: ocean is east-south-east.
+    if any(x in area_text for x in ["umhlanga", "bronze", "durban north", "virginia", "durban", "ballito", "umdloti", "salt rock"]):
+        return 105.0
+
+    # KZN South Coast bends more south-east.
+    if any(x in area_text for x in ["port edward", "leisure bay", "trafalgar", "palm beach", "southbroom", "margate"]):
+        return 122.0
+
+    # Wild Coast / Eastern Cape mostly south-east to east-south-east.
+    if any(x in area_text for x in ["port st johns", "wild coast", "coffee bay", "hole in the wall", "mbotyi", "kei"]):
+        return 128.0
+
+    # Western Cape south/west-facing beaches vary; use profile fallback.
+    profile = profile_for_area(str(area_name), lat, lon)
+    return float(profile.get("sea", 110))
+
+
+def get_true_cast_direction(area_name: str, stand: Tuple[float, float], stored_cast: Optional[Tuple[float, float]] = None) -> float:
+    """
+    Advanced display cast direction.
+
+    Rule:
+    - Stand coordinate is exact / calibrated.
+    - Cast bearing is shoreline-oriented and seaward.
+    - Stored cast points are only trusted if they are close to the expected
+      seaward vector; otherwise we clean the display line automatically.
+
+    This keeps the line visually correct even if old CSV cast coordinates were bad.
+    """
+    expected = expected_sea_bearing_for_spot(area_name, stand)
+
+    if stored_cast:
+        try:
+            stored_bearing = calculate_bearing(stand, stored_cast)
+            stored_distance = distance_m(stand, stored_cast)
+            # Trust a manually calibrated cast only if it is a realistic distance
+            # and roughly seaward. Otherwise default to local shoreline bearing.
+            if 25 <= stored_distance <= 140 and bearing_delta(stored_bearing, expected) <= 35:
+                return stored_bearing
+        except Exception:
+            pass
+
+    return expected
+
+
+def get_perpendicular_cast(
+    area_name: str,
+    stand: Tuple[float, float],
+    distance_meters: float = 70,
+    stored_cast: Optional[Tuple[float, float]] = None,
+) -> Tuple[float, float]:
+    """
+    Return a clean cast point from the standing point into the surf.
+    """
+    cast_bearing = get_true_cast_direction(area_name, stand, stored_cast)
+    return destination_point(stand, cast_bearing, distance_meters)
+
+
+def fixed_cast_from_stand(area_name: str, stand: Tuple[float, float], distance_meters: float = 70) -> Tuple[float, float]:
+    """Return a clean cast target from the standing point, perpendicular/shoreline-oriented to surf."""
+    return get_perpendicular_cast(area_name, stand, distance_meters)
+
+
+def cast_for_display(area_name: str, stand: Tuple[float, float], stored_cast: Tuple[float, float], default_distance: float = 70) -> Tuple[float, float]:
+    """
+    Display rule:
+    - Always keep the calibrated standing point.
+    - Use stored cast distance if realistic.
+    - Use stored cast bearing only if seaward and sensible.
+    - Otherwise auto-clean to a shoreline-oriented cast vector.
+
+    This prevents old/wrong cast data from drawing sideways or inland.
+    """
+    try:
+        d = distance_m(stand, stored_cast)
+        if not (30 <= d <= 140):
+            d = default_distance
+    except Exception:
+        d = default_distance
+
+    return get_perpendicular_cast(area_name, stand, d, stored_cast)
+
+
+def bearing_delta(a: float, b: float) -> float:
+    return abs((a - b + 180) % 360 - 180)
+
+
+def validate_calibrated_geometry(
+    area_name: str,
+    parking: Tuple[float, float],
+    stand: Tuple[float, float],
+    cast: Tuple[float, float],
+) -> Tuple[bool, List[str], List[str]]:
+    """
+    Validation used by the calibration tab before saving.
+
+    It does not move the user's clicked stand point. It only blocks clearly wrong
+    cast geometry and warns where points look suspicious.
+    """
+    errors, warnings = [], []
+
+    cast_dist = distance_m(stand, cast)
+    parking_dist = distance_m(parking, stand)
+    cast_bearing = calculate_bearing(stand, cast)
+    expected_sea = expected_sea_bearing_for_spot(area_name, stand)
+    sea_diff = bearing_delta(cast_bearing, expected_sea)
+
+    if cast_dist < 20:
+        errors.append("Cast target is too close to the stand. Use at least ±20m into the working water.")
+    elif cast_dist > 160:
+        warnings.append("Cast target is very far. Confirm this is realistic for the tackle/user.")
+
+    if sea_diff > 90:
+        errors.append(
+            f"Cast direction looks wrong for this coastline: {int(cast_bearing)}° vs expected sea direction around {int(expected_sea)}°. "
+            "Use auto-cast or move the cast target seaward from the standing point."
+        )
+    elif sea_diff > 45:
+        warnings.append(
+            f"Cast angle is unusual: {int(cast_bearing)}° vs expected sea direction around {int(expected_sea)}°. "
+            "This can be valid for a gully/river mouth, but double-check it."
+        )
+
+    if parking_dist < 20:
+        warnings.append("Parking/access is very close to the stand. Accept only if this is a beach-access/drop-off point.")
+
+    if distance_m(parking, cast) < distance_m(parking, stand):
+        warnings.append("Cast target is closer to parking than the stand. This may indicate stand/cast are reversed.")
+
+    # For South African east coast, the cast point should normally be east/south-east of stand.
+    area_text = str(area_name or "").lower()
+    if any(x in area_text for x in ["umhlanga", "durban", "ballito", "virginia", "port edward", "leisure", "trafalgar", "southbroom", "port st johns", "wild coast"]):
+        if cast[1] < stand[1] - 0.00005:
+            errors.append("Cast point is west/inland of the stand for this coastline. Move it into the sea or use auto-cast.")
+
+    return len(errors) == 0, errors, warnings
+
+
+def auto_cast_from_stand(area_name: str, stand: Tuple[float, float], distance_meters: float = 70) -> Tuple[float, float]:
+    return fixed_cast_from_stand(area_name, stand, distance_meters)
+
+
+def snap_stand_click_for_east_coast(area_name: str, clicked: Tuple[float, float]) -> Tuple[float, float]:
+    """
+    Advanced exact calibration:
+    NEVER move the user's clicked standing point.
+
+    The user should click the exact beach/rock/sand location where they can stand.
+    CastIQ only cleans the cast vector, not the stand point.
+    """
+    return clicked
+
+def get_loaded_key_from_label(label: str) -> str:
+    return str(label).split(" — ")[0]
+
+
+def local_spot_matches(query: str, limit: int = 12) -> List[Dict[str, Any]]:
+    """
+    Searches the curated CSV first.
+    Supports:
+    - region search: Wild Coast
+    - area search: Port St Johns
+    - specific spot search: Umhlanga Lighthouse
+    """
+    df = load_local_fishing_spots()
+    if df.empty or not query:
+        return []
+
+    q = query.strip().lower()
+    terms = [t for t in q.replace("-", " ").split() if t]
+
+    matches = []
+    for _, row in df.iterrows():
+        region = str(row["region"])
+        area = str(row["area"])
+        spot_name = str(row["spot_name"])
+        province = str(row["province"])
+        haystack = f"{region} {area} {spot_name} {province}".lower()
+
+        score = 0
+        if q in str(spot_name).lower():
+            score += 80
+        if q in str(area).lower():
+            score += 70
+        if q in str(region).lower():
+            score += 60
+        if all(t in haystack for t in terms):
+            score += 50
+        for t in terms:
+            if t in haystack:
+                score += 8
+
+        if score > 0:
+            matches.append({
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"]),
+                "display_name": f"{area} - {spot_name}, {region}, {province}",
+                "source": "Local fishing library",
+                "score": score,
+                "row": row.to_dict(),
+            })
+
+    matches.sort(key=lambda x: x["score"], reverse=True)
+
+    # De-duplicate by coordinate/name
+    clean = []
+    seen = set()
+    for m in matches:
+        key = (round(m["lat"], 5), round(m["lon"], 5), m["display_name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(m)
+
+    return clean[:limit]
+
+
+def local_csv_spots_for_ranking(planning_point: Tuple[float, float], radius_km: float, query: str = "") -> Dict[str, Dict[str, Any]]:
+    """
+    Converts CSV rows into app-compatible fishing spots for ranking.
+    This means Port St Johns / Wild Coast returns many real fishing nodes.
+    """
+    df = load_local_fishing_spots()
+    if df.empty:
+        return {}
+
+    spots = {}
+    q = (query or "").lower().strip()
+
+    for _, row in df.iterrows():
+        point = (float(row["lat"]), float(row["lon"]))
+        d = distance_km(planning_point, point)
+
+        haystack = f"{row['region']} {row['area']} {row['spot_name']} {row['province']}".lower()
+        query_match = bool(q and all(t in haystack for t in q.replace('-', ' ').split()))
+
+        # Include if inside radius OR if user specifically searched the matching region/area/spot.
+        if d > radius_km and not query_match:
+            continue
+
+        species_list = [s.strip() for s in str(row["main_species"]).split(";") if s.strip()]
+        species_list = [s if s in SPECIES else ("Shad / Elf" if s in ["Elf / Shad", "Shad"] else s) for s in species_list]
+        species_list = [s for s in species_list if s in SPECIES] or ["Kob", "Shad / Elf"]
+
+        spot_type = str(row["spot_type"]).lower()
+        if "river" in spot_type or "mouth" in spot_type or "estuary" in spot_type or "lagoon" in spot_type:
+            feature_type = "river mouth"
+            base_conf = 78
+        elif "gully" in spot_type or "rocks" in spot_type or "reef" in spot_type or "point" in spot_type:
+            feature_type = "gully"
+            base_conf = 76
+        elif "beach" in spot_type:
+            feature_type = "white water"
+            base_conf = 74
+        else:
+            feature_type = "coastal"
+            base_conf = 70
+
+        name = f"{row['area']} - {row['spot_name']}"
+
+        calibrated = row_has_calibrated_points(row)
+        override = coordinate_override_for(str(row["area"]), str(row["spot_name"]))
+
+        if override:
+            # Use curated hard coordinates first for known problem spots.
+            parking_point = override["parking"]
+            stand_point = override["stand"]
+            cast_point = cast_for_display(str(row["area"]), stand_point, override["cast"])
+            geometry_source = override["source"] + " | cast fixed east from stand"
+            calibrated = True
+        elif calibrated:
+            calibrated_points = row_get_calibrated_points(row)
+            stand_point = calibrated_points["stand"]
+            cast_point = calibrated_points["cast"]
+            parking_point = calibrated_points["parking"]
+            geometry_source = calibrated_points["source"]
+        else:
+            # Coordinate-first fallback:
+            # Use the CSV lat/lon as the standing/shoreline anchor, then cast seaward.
+            # For Durban/Umhlanga rough anchors, shift closer to the beach before casting.
+            profile = profile_for_area(str(row["area"]), point[0], point[1])
+            region_text = f"{row['region']} {row['area']} {row['spot_name']}".lower()
+            if "umhlanga" in region_text or "durban north" in region_text or "virginia" in region_text:
+                stand_point = destination_point(point, profile["sea"], 220)
+            else:
+                stand_point = point
+            cast_point = auto_cast_from_stand(str(row["area"]), stand_point, 70)
+            parking_point = destination_point(stand_point, profile["land"], 400)
+            geometry_source = "CSV shoreline anchor + cast-distance geometry; calibrate only to fine-tune"
+
+        spot_record = {
+            "area": str(row["area"]),
+            "spot_name": str(row["spot_name"]),
+            "stand": stand_point,
+            "cast": cast_point,
+            "parking": parking_point,
+            "structure": str(row["structure"]),
+            "feature_type": feature_type,
+            "base_confidence": base_conf,
+            "species": species_list,
+            "notes": f"{row['spot_name']} in {row['region']}. {row['structure']}",
+            "parking_note": str(row["parking_note"]),
+            "csv_generated": True,
+            "calibrated_geometry": calibrated,
+            "geometry_source": geometry_source,
+            "region": str(row["region"]),
+            "province": str(row["province"]),
+        }
+        for col in row.index:
+            if col not in spot_record:
+                spot_record[col] = row[col]
+        spots[name] = spot_record
+
+    return spots
+
+
 # =====================================================
 # Location search and coastline snapping
 # =====================================================
@@ -539,25 +1016,30 @@ def geocode_sa_location(query: str) -> Optional[Dict[str, Any]]:
 @st.cache_data(ttl=API_CACHE_TTL_SECONDS)
 def smart_location_suggestions(query: str) -> List[Dict[str, Any]]:
     """
-    Coastal-biased suggestions.
-    User can type 'Umhlanga' or 'Umhlanga Lighthouse'.
-    App returns coastal options first and avoids inland duplicates where possible.
+    Autocomplete suggestions.
+    Priority:
+    1. Local curated CSV fishing nodes
+    2. Known coastal aliases
+    3. OSM/Nominatim fallback
     """
     if not query or len(query.strip()) < 2:
         return []
 
     q = query.strip()
-    search_variants = [
-        f"{q} Beach, KwaZulu-Natal, South Africa",
-        f"{q} Lighthouse, KwaZulu-Natal, South Africa",
-        f"{q} Lagoon, KwaZulu-Natal, South Africa",
-        f"{q} Rocks, KwaZulu-Natal, South Africa",
-        f"{q}, eThekwini, KwaZulu-Natal, South Africa",
-        f"{q}, KwaZulu-Natal, South Africa",
-        f"{q}, South Africa",
-    ]
 
-    # Known coastal aliases to make common inputs work immediately
+    # 1) Local CSV first — fastest and most accurate.
+    local_matches = local_spot_matches(q, limit=10)
+    suggestions = []
+    for m in local_matches:
+        suggestions.append({
+            "lat": m["lat"],
+            "lon": m["lon"],
+            "display_name": m["display_name"],
+            "score": 200 + m.get("score", 0),
+            "source": "Local fishing library",
+        })
+
+    # 2) Known coastal aliases.
     known_aliases = {
         "umhlanga": [
             {"lat": -29.717820, "lon": 31.089420, "display_name": "Umhlanga Lighthouse, Umhlanga, KwaZulu-Natal"},
@@ -565,83 +1047,84 @@ def smart_location_suggestions(query: str) -> List[Dict[str, Any]]:
             {"lat": -29.720500, "lon": 31.088000, "display_name": "Umhlanga Lagoon Mouth, KwaZulu-Natal"},
             {"lat": -29.724000, "lon": 31.086800, "display_name": "Umhlanga Rocks Beach, KwaZulu-Natal"},
         ],
-        "ballito": [
-            {"lat": -29.538150, "lon": 31.218950, "display_name": "Ballito Tidal Pool / Beach, KwaZulu-Natal"},
-            {"lat": -29.526500, "lon": 31.223200, "display_name": "Willard Beach, Ballito, KwaZulu-Natal"},
+        "wild coast": [
+            {"lat": -31.6285, "lon": 29.5460, "display_name": "Port St Johns - First Beach, Wild Coast, Eastern Cape"},
+            {"lat": -31.6380, "lon": 29.5260, "display_name": "Port St Johns - Second Beach, Wild Coast, Eastern Cape"},
+            {"lat": -31.6275, "lon": 29.5480, "display_name": "Port St Johns - Umzimvubu River Mouth, Wild Coast, Eastern Cape"},
+            {"lat": -31.9850, "lon": 29.1510, "display_name": "Coffee Bay Main Beach, Wild Coast, Eastern Cape"},
+            {"lat": -32.0330, "lon": 29.1200, "display_name": "Hole in the Wall, Wild Coast, Eastern Cape"},
+            {"lat": -32.6800, "lon": 28.3700, "display_name": "Kei Mouth River Mouth, Wild Coast, Eastern Cape"},
         ],
-        "port edward": [
-            {"lat": -31.050700, "lon": 30.226400, "display_name": "Port Edward Rocky Point / Beach, KwaZulu-Natal"},
-        ],
-        "trafalgar": [
-            {"lat": -30.833900, "lon": 30.410500, "display_name": "Trafalgar Beach, KwaZulu-Natal"},
-        ],
-        "southbroom": [
-            {"lat": -30.919200, "lon": 30.328700, "display_name": "Southbroom River Mouth, KwaZulu-Natal"},
+        "port st johns": [
+            {"lat": -31.6285, "lon": 29.5460, "display_name": "Port St Johns - First Beach, Wild Coast, Eastern Cape"},
+            {"lat": -31.6380, "lon": 29.5260, "display_name": "Port St Johns - Second Beach, Wild Coast, Eastern Cape"},
+            {"lat": -31.6275, "lon": 29.5480, "display_name": "Port St Johns - Umzimvubu River Mouth, Wild Coast, Eastern Cape"},
+            {"lat": -31.6500, "lon": 29.5150, "display_name": "Port St Johns - Agate Terrace, Wild Coast, Eastern Cape"},
+            {"lat": -31.6660, "lon": 29.4880, "display_name": "Port St Johns - Poenskop, Wild Coast, Eastern Cape"},
         ],
     }
 
-    suggestions = []
     q_lower = q.lower()
     for key, vals in known_aliases.items():
         if q_lower == key or key in q_lower or q_lower in key:
-            suggestions.extend(vals)
+            for v in vals:
+                suggestions.append({**v, "score": 180, "source": "Known coastal alias"})
 
-    seen = set()
-    for variant in search_variants:
-        data = safe_request_json(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": variant, "format": "json", "limit": 4, "addressdetails": 1, "countrycodes": "za"},
-            retries=1,
-        )
-        if not data:
-            continue
-        for item in data:
-            try:
-                lat = float(item["lat"])
-                lon = float(item["lon"])
-            except Exception:
+    # 3) OSM fallback only if local suggestions are thin.
+    if len(suggestions) < 5 and not st.session_state.get("FAST_MODE", True):
+        search_variants = [
+            f"{q} Beach, South Africa",
+            f"{q} River Mouth, South Africa",
+            f"{q} Lighthouse, South Africa",
+            f"{q} Lagoon, South Africa",
+            f"{q} Rocks, South Africa",
+            f"{q}, South Africa",
+        ]
+
+        for variant in search_variants:
+            data = safe_request_json(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": variant, "format": "json", "limit": 4, "addressdetails": 1, "countrycodes": "za"},
+                retries=1,
+            )
+            if not data:
                 continue
+            for item in data:
+                try:
+                    lat = float(item["lat"])
+                    lon = float(item["lon"])
+                except Exception:
+                    continue
 
-            display = item.get("display_name", variant)
+                display = item.get("display_name", variant)
+                if lon < 16 or lon > 33 or lat < -35 or lat > -22:
+                    continue
 
-            # Coastal bias:
-            # Avoid obvious inland results when a coastal option exists.
-            # KZN coast longitudes are usually ~30.2 to 31.3.
-            # This filter is intentionally loose to support SA-wide coastal searches.
-            if lon < 18 or lon > 33 or lat < -35 or lat > -22:
-                continue
+                coastal_words = ["beach", "lighthouse", "lagoon", "rocks", "mouth", "coast", "harbour", "bay", "strand"]
+                score = 50
+                if any(w in display.lower() for w in coastal_words):
+                    score += 20
 
-            key = (round(lat, 5), round(lon, 5), display[:60])
-            if key in seen:
-                continue
-            seen.add(key)
+                suggestions.append({
+                    "lat": lat,
+                    "lon": lon,
+                    "display_name": display,
+                    "score": score,
+                    "source": "OpenStreetMap",
+                })
 
-            coastal_words = ["beach", "lighthouse", "lagoon", "rocks", "mouth", "coast", "harbour", "bay", "strand"]
-            score = 0
-            disp_l = display.lower()
-            if any(w in disp_l for w in coastal_words):
-                score += 20
-            if "kwazulu-natal" in disp_l or "ethekwini" in disp_l:
-                score += 10
-            # Prefer results near the sea in KZN/EC/WC instead of inland same-name towns
-            if lon >= 28:
-                score += 5
-
-            suggestions.append({"lat": lat, "lon": lon, "display_name": display, "score": score})
-
-    # De-duplicate again and rank
+    # De-duplicate and rank.
     clean = []
-    seen2 = set()
+    seen = set()
     for s in suggestions:
-        key = (round(s["lat"], 4), round(s["lon"], 4))
-        if key in seen2:
+        key = (round(float(s["lat"]), 4), round(float(s["lon"]), 4), s["display_name"][:50])
+        if key in seen:
             continue
-        seen2.add(key)
+        seen.add(key)
         clean.append(s)
 
     clean.sort(key=lambda x: x.get("score", 0), reverse=True)
-    return clean[:8]
-
+    return clean[:10]
 
 def selected_location_from_suggestions(query: str) -> Optional[Dict[str, Any]]:
     suggestions = smart_location_suggestions(query)
@@ -828,38 +1311,216 @@ def find_realistic_parking_and_access(
     return parking, access_point, source
 
 
+
+@st.cache_data(ttl=API_CACHE_TTL_SECONDS)
+def overpass_walkable_features(lat: float, lon: float, radius_m: int = 1800) -> List[Dict[str, Any]]:
+    """
+    Finds walkable roads/paths around the stand.
+    This is NOT turn-by-turn routing, but it gives realistic intermediate nodes
+    so the map does not draw one fake straight line through houses/water.
+    """
+    if st.session_state.get("FAST_MODE", True):
+        return []
+
+    query = f"""
+    [out:json][timeout:15];
+    (
+      node(around:{radius_m},{lat},{lon})["highway"~"footway|path|track|service|residential|tertiary|unclassified"];
+      way(around:{radius_m},{lat},{lon})["highway"~"footway|path|track|service|residential|tertiary|unclassified"];
+    );
+    out center tags 180;
+    """
+    data = safe_request_json("https://overpass-api.de/api/interpreter", params={"data": query}, timeout=20, retries=0)
+    if not data or "elements" not in data:
+        return []
+
+    points = []
+    seen = set()
+    for el in data["elements"]:
+        tags = el.get("tags", {})
+        if "lat" in el and "lon" in el:
+            flat, flon = float(el["lat"]), float(el["lon"])
+        elif "center" in el:
+            flat, flon = float(el["center"]["lat"]), float(el["center"]["lon"])
+        else:
+            continue
+
+        key = (round(flat, 5), round(flon, 5))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        points.append({
+            "lat": flat,
+            "lon": flon,
+            "type": tags.get("highway", "path"),
+            "name": tags.get("name", tags.get("highway", "path")),
+        })
+
+    return points
+
+
+def _bearing_diff(a: float, b: float) -> float:
+    return abs((a - b + 180) % 360 - 180)
+
+
+def choose_path_node(
+    points: List[Dict[str, Any]],
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    preferred_bearing: Optional[float] = None,
+    min_from_start_m: int = 40,
+) -> Optional[Tuple[float, float]]:
+    """
+    Picks a sensible intermediate path node between start and end.
+    """
+    if not points:
+        return None
+
+    direct_bearing = calculate_bearing(start, end)
+    scored = []
+    total = max(distance_m(start, end), 1)
+
+    for p in points:
+        pt = (p["lat"], p["lon"])
+        ds = distance_m(start, pt)
+        de = distance_m(pt, end)
+
+        if ds < min_from_start_m:
+            continue
+        if de > total * 1.25 and ds > total * 1.25:
+            continue
+
+        b = calculate_bearing(start, pt)
+        bearing_penalty = _bearing_diff(b, preferred_bearing if preferred_bearing is not None else direct_bearing)
+
+        score = 1000
+        score -= (ds + de) * 0.28
+        score -= bearing_penalty * 3
+
+        t = str(p.get("type", "")).lower()
+        if t in ["footway", "path", "track"]:
+            score += 120
+        elif t in ["service", "residential"]:
+            score += 80
+
+        scored.append((score, pt))
+
+    if not scored:
+        return None
+
+    return sorted(scored, key=lambda x: x[0], reverse=True)[0][1]
+
+
+def build_realistic_walk_route(
+    parking: Tuple[float, float],
+    stand: Tuple[float, float],
+    access_point: Optional[Tuple[float, float]],
+    land_bearing: float,
+) -> Tuple[List[Tuple[float, float]], str]:
+    """
+    Creates a more realistic visual walking route:
+    - Try OSM path/road nodes first.
+    - If unavailable, create a dog-leg route that stays landward before approaching the stand.
+    This avoids the previous fake straight line across houses/river/water.
+    """
+    points = overpass_walkable_features(stand[0], stand[1], radius_m=2200)
+
+    route = [parking]
+    route_source = "Dog-leg landward route"
+
+    if points:
+        # Node near parking/road side
+        first = choose_path_node(points, parking, access_point or stand, preferred_bearing=calculate_bearing(parking, access_point or stand))
+        if first and distance_m(parking, first) > 30:
+            route.append(first)
+
+        # Node near beach/access side
+        if access_point:
+            second = choose_path_node(points, route[-1], access_point, preferred_bearing=calculate_bearing(route[-1], access_point), min_from_start_m=30)
+            if second and distance_m(route[-1], second) > 30 and distance_m(second, access_point) > 30:
+                route.append(second)
+            route.append(access_point)
+        else:
+            route.append(destination_point(stand, land_bearing, 90))
+
+        route_source = "OSM-assisted walking path"
+    else:
+        # Fallback: landward dog-leg route.
+        # Move from parking along landward/road-side direction, then across, then down to access point.
+        # This is intentionally not a direct line.
+        safe_access = access_point or destination_point(stand, land_bearing, 90)
+        mid1 = destination_point(parking, calculate_bearing(parking, safe_access), min(350, max(120, distance_m(parking, safe_access) * 0.35)))
+        # Pull mid1 slightly landward to avoid beach/water crossing
+        mid1 = destination_point(mid1, land_bearing, 120)
+        mid2 = destination_point(safe_access, land_bearing, 130)
+
+        for pt in [mid1, mid2, safe_access]:
+            if distance_m(route[-1], pt) > 25:
+                route.append(pt)
+
+    if distance_m(route[-1], stand) > 20:
+        route.append(stand)
+
+    # Remove near-duplicate consecutive points
+    cleaned = []
+    for pt in route:
+        if not cleaned or distance_m(cleaned[-1], pt) > 15:
+            cleaned.append(pt)
+
+    return cleaned, route_source
+
+
 def snap_point_to_coast(
     planning_point: Tuple[float, float],
     area_name: str,
     preferred_point: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], Dict[str, Any]]:
     """
-    Returns parking/access-ish point, stand point, cast point, metadata.
-    The strongest version would use polygons for land/water. This app uses:
-    - OSM coastal feature if available
-    - Area profile fallback if OSM unavailable
-    - Stand is pulled landward from coastline point
-    - Cast is pushed seaward from coastline point
+    Robust coastline snap for CastIQ Pro.
+
+    Important fix:
+    - Do not let a generic OSM coastal feature pull the stand into the ocean.
+    - When a curated CSV / stored spot coordinate exists, treat that as the shoreline anchor.
+    - Stand is placed landward from that shoreline anchor.
+    - Cast point is placed seaward from that shoreline anchor.
+    - Parking is placed further landward.
+
+    This keeps the person marker on land and the cast target in the surf/sea.
     """
     lat, lon = preferred_point if preferred_point else planning_point
     profile = profile_for_area(area_name, lat, lon)
 
-    # Try OSM coastal feature nearest to the spot/planning location
-    osm_features = overpass_coastal_features(planning_point[0], planning_point[1], radius_m=10000)
     coast_point = (lat, lon)
-    coast_source = "Stored spot / fallback profile"
+    coast_source = "Stored spot / CSV shoreline anchor"
 
-    if osm_features:
-        nearest = min(osm_features, key=lambda f: distance_km(planning_point, (f["lat"], f["lon"])))
-        # Only use OSM point if it is reasonably close to the planning point
-        if distance_km(planning_point, (nearest["lat"], nearest["lon"])) <= 10:
-            coast_point = (nearest["lat"], nearest["lon"])
-            coast_source = f"OSM coastal feature: {nearest['name']}"
+    # Only use OSM coastline when we do NOT already have a curated/stored point.
+    # The previous version could select an OSM bay/coast feature offshore and put the angler in the sea.
+    if preferred_point is None and not st.session_state.get("FAST_MODE", True):
+        osm_features = overpass_coastal_features(planning_point[0], planning_point[1], radius_m=10000)
+        if osm_features:
+            nearest = min(osm_features, key=lambda f: distance_km(planning_point, (f["lat"], f["lon"])))
+            if distance_km(planning_point, (nearest["lat"], nearest["lon"])) <= 10:
+                coast_point = (nearest["lat"], nearest["lon"])
+                coast_source = f"OSM coastal feature: {nearest['name']}"
 
-    land_bearing = profile["land"]
-    sea_bearing = profile["sea"]
-    stand = destination_point(coast_point, land_bearing, profile["stand_inland_m"])
-    cast = destination_point(coast_point, sea_bearing, profile["cast_m"])
+    land_bearing = float(profile["land"])
+    sea_bearing = float(profile["sea"])
+
+    # Build the first-pass points.
+    stand = destination_point(coast_point, land_bearing, float(profile.get("stand_inland_m", 35)))
+    cast = destination_point(coast_point, sea_bearing, float(profile.get("cast_m", 75)))
+
+    # Safety guard: if the stand ends up farther from the planning point than the coastline anchor,
+    # the land/sea bearing is likely reversed for that specific coastline. Flip bearings.
+    try:
+        if distance_m(planning_point, stand) > distance_m(planning_point, coast_point) + 120:
+            land_bearing, sea_bearing = sea_bearing, land_bearing
+            stand = destination_point(coast_point, land_bearing, float(profile.get("stand_inland_m", 35)))
+            cast = destination_point(coast_point, sea_bearing, float(profile.get("cast_m", 75)))
+            coast_source += " | bearing sanity-flipped"
+    except Exception:
+        pass
 
     parking, access_point, parking_source = find_realistic_parking_and_access(
         stand=stand,
@@ -867,14 +1528,23 @@ def snap_point_to_coast(
         land_bearing=land_bearing,
     )
 
+    walk_route, walk_route_source = build_realistic_walk_route(
+        parking=parking,
+        stand=stand,
+        access_point=access_point,
+        land_bearing=land_bearing,
+    )
+
     return parking, stand, cast, {
         "coast_source": coast_source,
         "parking_source": parking_source,
         "access_point": access_point,
+        "walk_route": walk_route,
+        "walk_route_source": walk_route_source,
         "sea_bearing": sea_bearing,
         "land_bearing": land_bearing,
-        "stand_inland_m": profile["stand_inland_m"],
-        "cast_m": profile["cast_m"],
+        "stand_inland_m": profile.get("stand_inland_m", 35),
+        "cast_m": profile.get("cast_m", 75),
         "coast_point": coast_point,
     }
 
@@ -1212,6 +1882,26 @@ def choose_target_species(preferred_target, likely_species, available_baits):
     return chosen, None
 
 
+
+
+def is_query_specific(query: str) -> bool:
+    """
+    Region-lock trigger. If user searches a named coastal area/region,
+    CastIQ should not let faraway fallback spots outrank local CSV nodes.
+    """
+    if not query:
+        return False
+    q = str(query).lower().strip()
+    specific_terms = [
+        "port st johns", "port saint johns", "psj", "wild coast",
+        "coffee bay", "hole in the wall", "mbotyi", "mdumbi",
+        "kei mouth", "mazeppa", "morgan bay", "umngazi", "umzimvubu",
+        "umhlanga", "ballito", "port edward", "trafalgar", "southbroom",
+        "leisure bay", "palm beach", "durban", "sodwana", "st lucia",
+        "kosi bay", "cape vidal", "richards bay", "salt rock", "zinkwazi",
+    ]
+    return any(term in q for term in specific_terms)
+
 def build_osm_dynamic_spots(planning_point, radius_km, known_names) -> Dict[str, Dict[str, Any]]:
     features = overpass_coastal_features(planning_point[0], planning_point[1], radius_m=int(radius_km * 1000))
     dynamic = {}
@@ -1240,9 +1930,23 @@ def build_osm_dynamic_spots(planning_point, radius_km, known_names) -> Dict[str,
 
 
 def build_ranked_recommendations(planning_point, radius_km, preferred_target, available_baits, time_bucket, trip_date):
-    all_spots = dict(FISHING_SPOTS)
-    dynamic = build_osm_dynamic_spots(planning_point, radius_km, set(all_spots.keys()))
-    all_spots.update(dynamic)
+    query_context = search_query if "search_query" in globals() else ""
+
+    # Curated CSV fishing nodes first. This is what gives regions like
+    # Port St Johns / Wild Coast multiple real fishing options.
+    csv_spots = local_csv_spots_for_ranking(planning_point, radius_km, query=query_context)
+    dynamic = build_osm_dynamic_spots(planning_point, radius_km, set(csv_spots.keys()))
+
+    # Region lock: when the user clearly searched a specific coastal region/area,
+    # do NOT allow old hardcoded fallback spots from elsewhere to outrank local nodes.
+    if is_query_specific(query_context):
+        all_spots = dict(csv_spots)
+        if len(csv_spots) < 5:
+            all_spots.update(dynamic)
+    else:
+        all_spots = dict(csv_spots)
+        all_spots.update(dynamic)
+        all_spots.update(FISHING_SPOTS)
 
     rows = []
     detailed = {}
@@ -1251,11 +1955,31 @@ def build_ranked_recommendations(planning_point, radius_km, preferred_target, av
         d = distance_km(planning_point, spot["stand"])
         if d > radius_km:
             continue
+        if is_query_specific(query_context) and d > 25:
+            continue
 
         selected_species, bait_warning = choose_target_species(preferred_target, spot["species"], available_baits)
 
-        # Use snapped stand/cast for condition lookup where possible
-        parking, stand, cast, coast_meta = snap_point_to_coast(planning_point, spot["area"], spot.get("stand"))
+        # Coordinate-first geometry: if CSV/calibration gives stand/cast/parking, use it exactly.
+        # Only fall back to coastline snapping for old hardcoded/dynamic records.
+        if spot.get("csv_generated") or spot.get("calibrated_geometry") or spot.get("geometry_source"):
+            parking = spot.get("parking", spot.get("stand"))
+            stand = spot.get("stand")
+            cast = spot.get("cast")
+            coast_meta = {
+                "coast_source": spot.get("geometry_source", "CSV coordinate-first geometry"),
+                "parking_source": "CSV/general access",
+                "access_point": None,
+                "walk_route": [],
+                "walk_route_source": "Disabled — use Google Maps navigation",
+                "sea_bearing": calculate_bearing(stand, cast),
+                "land_bearing": opposite_bearing(calculate_bearing(stand, cast)),
+                "stand_inland_m": 0,
+                "cast_m": distance_m(stand, cast),
+                "coast_point": stand,
+            }
+        else:
+            parking, stand, cast, coast_meta = snap_point_to_coast(planning_point, spot["area"], spot.get("stand"))
 
         conditions = fetch_conditions(stand[0], stand[1], trip_date.strftime("%Y-%m-%d"), time_bucket)
         moon = moon_phase_name(trip_date)
@@ -1387,7 +2111,7 @@ def auto_test_one_location(test_location: str, test_bait: List[str], test_target
             add("Cast distance realistic", "FAIL", f"{int(cast_distance)}m outside expected range.")
 
         parking_distance = distance_m(parking, stand)
-        if 50 <= parking_distance <= 1500:
+        if 50 <= parking_distance <= 2500:
             add("Parking point exists", "PASS", f"Parking is {int(parking_distance)}m from stand.")
         else:
             add("Parking point exists", "WARN", f"Parking is {int(parking_distance)}m from stand; check access practicality.")
@@ -1469,6 +2193,54 @@ st.markdown("""
         margin-right: 6px;
         font-size: 0.85rem;
     }
+
+    .rank-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 16px 16px 14px 16px;
+        background: #ffffff;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+        margin-bottom: 12px;
+        min-height: 215px;
+    }
+    .rank-card-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+    }
+    .rank-title {
+        font-size: 1.05rem;
+        font-weight: 800;
+        line-height: 1.25;
+        color: #0f172a;
+    }
+    .rank-score {
+        font-size: 1.25rem;
+        font-weight: 900;
+        color: #065f46;
+        white-space: nowrap;
+    }
+    .rank-meta {
+        font-size: 0.86rem;
+        color: #475569;
+        margin: 3px 0;
+    }
+    .rank-reason {
+        margin-top: 8px;
+        font-size: 0.88rem;
+        color: #334155;
+        background: #f8fafc;
+        border-radius: 12px;
+        padding: 9px;
+        min-height: 42px;
+    }
+    .badge-high {background:#dcfce7;color:#166534;}
+    .badge-medium {background:#fef9c3;color:#854d0e;}
+    .badge-fair {background:#ffedd5;color:#9a3412;}
+    .badge-low {background:#fee2e2;color:#991b1b;}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1507,7 +2279,7 @@ if planning_point is None:
         location_basis = found["display_name"]
         st.sidebar.success(f"Using: {found['display_name']}")
     else:
-        st.sidebar.error("Location not found. Try e.g. Umhlanga, Umhlanga Lighthouse, Ballito Beach, Port Edward Beach.")
+        st.sidebar.error("Location not found. Try e.g. Umhlanga, Port St Johns, Wild Coast, Ballito Beach, or check that data/sa_fishing_spots.csv exists.")
         st.stop()
 
 trip_date = st.sidebar.date_input("Fishing date", value=datetime.today())
@@ -1523,6 +2295,8 @@ preferred_target = st.sidebar.selectbox("Preferred target species", ["Auto selec
 with st.sidebar.expander("API status"):
     st.write("Open-Meteo: no key required")
     st.write("Nominatim/OSM: no key required")
+    local_df_status = load_local_fishing_spots()
+    st.write(f"Local fishing library: {len(local_df_status)} spots loaded" if not local_df_status.empty else "Local fishing library: not found")
     st.write(f"WorldTides key: {'Loaded' if WORLD_TIDES_API_KEY else 'Not configured'}")
     st.write(f"Stormglass key: {'Loaded' if STORMGLASS_API_KEY else 'Not configured'}")
     st.caption("No key = no crash. App uses fallback logic.")
@@ -1558,6 +2332,7 @@ tab_names = [
     "📏 Regulations",
     "💎 Upgrade",
     "💬 Feedback",
+    "🛠 Calibration",
 ]
 if show_dev_tools:
     tab_names.append("🧪 Auto Test")
@@ -1633,12 +2408,45 @@ with tabs[0]:
         st.write(f"**Spot potential:** {int(best_row['Spot potential'])}%")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.subheader("Ranked fishing options")
-    st.caption("The table and loaded recommendation now use the same final live-adjusted confidence engine.")
-    st.dataframe(ranked_df, use_container_width=True, hide_index=True)
+    st.subheader("Recommended fishing options")
+    st.caption("Clean cards ranked by live-adjusted confidence, local relevance, structure, bait match and distance.")
+
+    top_cards = ranked_df.head(6).reset_index(drop=True)
+    card_cols = st.columns(3)
+    for idx, row in top_cards.iterrows():
+        selected_card_label = f"{row['Spot']} — {row['Fishing confidence']}% ({row['Confidence range']})"
+        conf = str(row["Confidence range"]).lower()
+        badge_class = "badge-high" if conf == "high" else "badge-medium" if conf == "medium" else "badge-fair" if conf == "fair" else "badge-low"
+        with card_cols[idx % 3]:
+            st.markdown(
+                f"""
+                <div class="rank-card">
+                    <div class="rank-card-top">
+                        <div class="rank-title">#{idx + 1} {row['Spot']}</div>
+                        <div class="rank-score">{int(row['Fishing confidence'])}%</div>
+                    </div>
+                    <span class="pill {badge_class}">{row['Confidence range']}</span>
+                    <div class="rank-meta">📍 <b>Area:</b> {row['Area']}</div>
+                    <div class="rank-meta">🚶 <b>Distance:</b> {row['Distance km']} km</div>
+                    <div class="rank-meta">🎯 <b>Target:</b> {row['Suggested target']}</div>
+                    <div class="rank-meta">🌊 <b>Spot potential:</b> {int(row['Spot potential'])}%</div>
+                    <div class="rank-reason"><b>Structure:</b> {row['Structure']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            button_text = "✅ Loaded" if st.session_state.get("selected_option_label") == selected_card_label else f"Load option #{idx + 1}"
+            if st.button(button_text, key=f"load_rank_card_{idx}", width="stretch"):
+                st.session_state["selected_option_label"] = selected_card_label
+                st.session_state["selected_rank_index"] = idx
+                st.session_state["loaded_recommendation_key"] = selected_card_label.split(" — ")[0]
+                st.rerun()
+
+    with st.expander("Show full ranking table"):
+        st.dataframe(ranked_df, width="stretch", hide_index=True)
 
     selected_label = st.selectbox(
-        "Select the fishing option you want to load",
+        "Loaded fishing option",
         option_labels,
         index=option_labels.index(st.session_state.selected_option_label),
     )
@@ -1662,9 +2470,10 @@ with tabs[0]:
         st.write(f"**Conditions score:** {loaded['condition_score']}%")
         st.write(f"**Spot potential:** {loaded['score_detail']['raw_spot_potential']}%")
 
-    bearing = calculate_bearing(loaded["stand"], loaded["cast"])
+    display_cast = cast_for_display(loaded["spot"].get("area", ""), loaded["stand"], loaded["cast"])
+    bearing = calculate_bearing(loaded["stand"], display_cast)
     compass = bearing_to_compass(bearing)
-    cast_distance = distance_m(loaded["stand"], loaded["cast"])
+    cast_distance = distance_m(loaded["stand"], display_cast)
     st.success(
         f"{human_direction_text(compass)}\n\n"
         f"Cast towards: **{compass}**  \n"
@@ -1678,9 +2487,10 @@ with tabs[0]:
 
 
 with tabs[1]:
-    selected_name = st.session_state.selected_option_label.split(" — ")[0]
+    selected_name = get_loaded_key_from_label(st.session_state.selected_option_label)
     loaded = detailed[selected_name]
     parking, stand, cast = loaded["parking"], loaded["stand"], loaded["cast"]
+    cast = cast_for_display(loaded["spot"].get("area", ""), stand, cast)
     access_point = loaded["coast_meta"].get("access_point")
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
@@ -1694,16 +2504,17 @@ with tabs[1]:
     walk_current_url = f"https://www.google.com/maps/dir/?api=1&origin={planning_point[0]},{planning_point[1]}&destination={stand[0]},{stand[1]}&travelmode=walking"
 
     with nav1:
-        st.link_button("🚗 Navigate to parking", drive_url, use_container_width=True)
+        st.link_button("🚗 Navigate to parking", drive_url, width="stretch")
     with nav2:
-        st.link_button("🚶 Walk parking → stand", walk_parking_url, use_container_width=True)
+        st.link_button("🧭 Navigate to standing spot", walk_current_url, width="stretch")
     with nav3:
-        st.link_button("📍 Walk current → stand", walk_current_url, use_container_width=True)
+        st.link_button("📍 Open stand in Google Maps", google_maps_url(stand[0], stand[1], "walking"), width="stretch")
 
     st.info(
         f"Parking note: {loaded['spot'].get('parking_note', 'Use nearest legal public parking/access.')}\n\n"
-        f"Parking/access source: {loaded['coast_meta'].get('parking_source', 'Not available')}\n\n"
-        f"Then walk via the beach access point to the stand point and cast {int(cast_distance)}m towards {compass}."
+        f"Geometry source: {loaded['spot'].get('geometry_source', loaded['coast_meta'].get('coast_source', 'Not available'))}\n\n"
+        f"Use the navigation button to get to the standing spot. Cast {int(cast_distance)}m towards {compass}. "
+        "If the standing marker is not exactly on the beach/rocks, use the Calibration tab once for this spot."
     )
 
     if folium and st_folium:
@@ -1714,16 +2525,15 @@ with tabs[1]:
             attr="Esri World Imagery",
             name="Satellite",
         ).add_to(m)
-        folium.Marker(planning_point, tooltip="Planning point", icon=folium.Icon(color="blue", icon="search", prefix="fa")).add_to(m)
-        folium.Marker(parking, tooltip="Parking / road access", icon=folium.Icon(color="green", icon="car", prefix="fa")).add_to(m)
-        if access_point:
-            folium.Marker(access_point, tooltip="Beach access point", icon=folium.Icon(color="orange", icon="map-signs", prefix="fa")).add_to(m)
+        folium.Marker(planning_point, tooltip="Planning/search point", icon=folium.Icon(color="blue", icon="search", prefix="fa")).add_to(m)
+        if parking and distance_m(parking, stand) > 20:
+            folium.Marker(parking, tooltip="General parking / access area", icon=folium.Icon(color="green", icon="car", prefix="fa")).add_to(m)
+        # No fake access/walking route marker. Use Google Maps button for actual navigation.
         folium.Marker(stand, tooltip="Stand here", icon=folium.DivIcon(html='<div style="font-size:34px;">🧍‍♂️</div>')).add_to(m)
         folium.Marker(cast, tooltip="Cast target", icon=folium.Icon(color="red", icon="bullseye", prefix="fa")).add_to(m)
-        folium.PolyLine([parking, access_point, stand] if access_point else [parking, stand], color="green", weight=4, tooltip="Suggested walk path").add_to(m)
-        folium.PolyLine([stand, cast], color="blue", weight=5, tooltip=f"Cast {int(cast_distance)}m {compass}").add_to(m)
+        folium.PolyLine([stand, cast], color="blue", weight=5, dash_array="8,8", tooltip=f"Cast {int(cast_distance)}m {compass}").add_to(m)
         folium.Circle(cast, radius=18, fill=True, tooltip="Bait landing zone").add_to(m)
-        st_folium(m, width=1200, height=600)
+        st_folium(m, width=1200, height=600, returned_objects=[])
     else:
         st.warning("Map packages not loaded. Install: pip install folium streamlit-folium")
 
@@ -1731,8 +2541,8 @@ with tabs[1]:
     directions = [
         "Drive to the road-side parking or public access point first.",
         "Confirm the parking/access is legal and safe before leaving your vehicle.",
-        "Walk towards the beach access marker first; do not cross river channels or unsafe water.",
-        "From the access point, walk along safe dry sand or stable rock towards the stand marker.",
+        "Use Google Maps to navigate to the standing spot; CastIQ no longer draws fake walking routes.",
+        "Treat parking/access as approximate. Confirm legal and safe access before leaving your vehicle.",
         "Stop above the wash line and reassess waves, current and footing.",
         human_direction_text(compass).replace(".", ""),
         f"Cast towards {compass}, bearing {int(bearing)} degrees, around {int(cast_distance)} metres.",
@@ -1745,6 +2555,7 @@ with tabs[2]:
     selected_name = st.session_state.selected_option_label.split(" — ")[0]
     loaded = detailed[selected_name]
     stand, cast = loaded["stand"], loaded["cast"]
+    cast = cast_for_display(loaded["spot"].get("area", ""), stand, cast)
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
     cast_distance = distance_m(stand, cast)
@@ -1809,7 +2620,7 @@ with tabs[3]:
         st.metric("Conditions score", f"{loaded['condition_score']}%")
 
     if t.get("next_tides"):
-        st.dataframe(pd.DataFrame(t["next_tides"]), use_container_width=True)
+        st.dataframe(pd.DataFrame(t["next_tides"]), width="stretch")
     if loaded["cond_pos"]:
         st.success("Positive signals: " + " | ".join(loaded["cond_pos"]))
     if loaded["cond_neg"]:
@@ -1863,7 +2674,7 @@ with tabs[5]:
     else:
         st.warning("Regulation not loaded for this species yet.")
 
-    st.dataframe(pd.DataFrame([{"Fish": f, **d} for f, d in REGULATIONS.items()]), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame([{"Fish": f, **d} for f, d in REGULATIONS.items()]), width="stretch", hide_index=True)
     st.warning("Prototype regulation guide only. Verify current official regulations before keeping fish.")
 
 
@@ -1874,4 +2685,322 @@ with tabs[6]:
     def package_card(image_path, title, persona, price, description, features, button_label):
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
         if os.path.exists(image_path):
-            st.image(image_path, use_container_width
+            st.image(image_path, width="stretch")
+        else:
+            st.info(f"Add image: {image_path}")
+        st.subheader(title)
+        st.caption(persona)
+        st.markdown(f"### {price}")
+        st.write(description)
+        for feature in features:
+            st.write(f"✅ {feature}")
+        st.button(button_label, width="stretch")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        package_card(
+            "assets/standard.jpg",
+            "STANDARD 🎣",
+            "Standard Fisherman",
+            "R0",
+            "Basic shoreline guidance for casual fishing sessions.",
+            [
+                "Search fishing areas",
+                "Basic conditions view",
+                "Simple recommendations",
+            ],
+            "Start Free",
+        )
+
+    with col2:
+        package_card(
+            "assets/pro.jpg",
+            "PRO ⭐",
+            "Pro Fisherman",
+            "R49 / month",
+            "Fish smarter with ranked options and guided decisions.",
+            [
+                "Exact stand and cast direction",
+                "Bait and species matching",
+                "Ranked fishing spots",
+                "Parking to stand navigation",
+            ],
+            "Upgrade to Pro",
+        )
+
+    with col3:
+        package_card(
+            "assets/elite.jpg",
+            "ELITE 🔥",
+            "Elite Fisherman",
+            "R99 / month",
+            "Full real-time coastal intelligence for serious anglers.",
+            [
+                "Live/current location support",
+                "Dynamic coastline engine",
+                "On-the-Beach Mode",
+                "Advanced condition scoring",
+            ],
+            "Go Elite",
+        )
+
+with tabs[7]:
+    selected_name = st.session_state.selected_option_label.split(" — ")[0]
+    loaded = detailed[selected_name]
+
+    st.header("💬 Feedback / Accuracy Improvement")
+    with st.form("feedback_form"):
+        result = st.selectbox("Did the recommendation work?", ["Not fished yet", "Yes - caught fish", "Had bites only", "No action", "Wrong spot", "Wrong bait", "Wrong trace", "Wrong species"])
+        actual_species = st.text_input("What species did you catch or see?")
+        actual_bait = st.text_input("What bait worked or failed?")
+        catch_outcome = st.selectbox("Catch outcome", ["No catch", "Released", "Kept legally", "Unsure"])
+        comments = st.text_area("Your suggestion / improvement")
+        submitted = st.form_submit_button("Submit Feedback")
+
+        if submitted:
+            feedback = {
+                "timestamp": datetime.now().isoformat(),
+                "location_basis": location_basis,
+                "planning_lat": planning_point[0],
+                "planning_lon": planning_point[1],
+                "trip_date": str(trip_date),
+                "time_bucket": time_bucket,
+                "recommended_spot": selected_name,
+                "target_species": loaded["selected_species"],
+                "available_baits": ", ".join(available_baits),
+                "result": result,
+                "actual_species": actual_species,
+                "actual_bait": actual_bait,
+                "catch_outcome": catch_outcome,
+                "comments": comments,
+                "confidence": loaded["final_confidence"],
+                "condition_score": loaded["condition_score"],
+                "spot_potential": loaded["score_detail"]["raw_spot_potential"],
+            }
+            df_new = pd.DataFrame([feedback])
+            try:
+                df_old = pd.read_csv(FEEDBACK_FILE)
+                df_all = pd.concat([df_old, df_new], ignore_index=True)
+            except Exception:
+                df_all = df_new
+            df_all.to_csv(FEEDBACK_FILE, index=False)
+            st.success("Feedback saved. This will support the future learning engine.")
+
+
+
+with tabs[8]:
+    st.header("🛠 Spot Calibration")
+    st.caption("Advanced exact calibration: click the exact standing point and cast target. CastIQ will save the exact map lat/lon.")
+
+    selected_name = get_loaded_key_from_label(st.session_state.selected_option_label)
+    loaded = detailed[selected_name]
+    spot = loaded["spot"]
+    area = str(spot.get("area", ""))
+    spot_name = str(spot.get("spot_name", selected_name.replace(f"{area} - ", "")))
+
+    st.warning(
+        "Advanced mode: set the exact standing point and cast target once. The app will stop guessing and use your saved coordinates for this spot."
+    )
+
+    if st.session_state.get("calibration_selected_name") != selected_name:
+        st.session_state["calibration_selected_name"] = selected_name
+        st.session_state["cal_stand_lat"] = float(loaded["stand"][0])
+        st.session_state["cal_stand_lon"] = float(loaded["stand"][1])
+        st.session_state["cal_cast_lat"] = float(loaded["cast"][0])
+        st.session_state["cal_cast_lon"] = float(loaded["cast"][1])
+        st.session_state["cal_parking_lat"] = float(loaded["parking"][0])
+        st.session_state["cal_parking_lon"] = float(loaded["parking"][1])
+
+    st.subheader(f"Calibrating: {selected_name}")
+
+    action = st.radio(
+        "When you click on the map, set:",
+        ["Standing point", "Cast target", "Parking / access"],
+        horizontal=True,
+    )
+    st.info(
+        "Advanced mode is exact-coordinate first: click the real standing point on sand/rocks. "
+        "CastIQ will not move that point. It will auto-place a cast target into the surf, "
+        "or you can select 'Cast target' and click the exact landing zone."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.subheader("1) Stand here")
+        stand_lat = st.number_input("Stand latitude", format="%.7f", key="cal_stand_lat")
+        stand_lon = st.number_input("Stand longitude", format="%.7f", key="cal_stand_lon")
+    with c2:
+        st.subheader("2) Cast target")
+        cast_lat = st.number_input("Cast latitude", format="%.7f", key="cal_cast_lat")
+        cast_lon = st.number_input("Cast longitude", format="%.7f", key="cal_cast_lon")
+    with c3:
+        st.subheader("3) General parking/access")
+        parking_lat = st.number_input("Parking/access latitude", format="%.7f", key="cal_parking_lat")
+        parking_lon = st.number_input("Parking/access longitude", format="%.7f", key="cal_parking_lon")
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("Auto-cast from stand", width="stretch"):
+            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 70)
+            st.session_state["cal_cast_lat"] = float(new_cast[0])
+            st.session_state["cal_cast_lon"] = float(new_cast[1])
+            st.rerun()
+    with b2:
+        if st.button("Move cast to 90m", width="stretch"):
+            new_cast = auto_cast_from_stand(area, (stand_lat, stand_lon), 90)
+            st.session_state["cal_cast_lat"] = float(new_cast[0])
+            st.session_state["cal_cast_lon"] = float(new_cast[1])
+            st.rerun()
+    with b3:
+        if st.button("Reset to loaded values", width="stretch"):
+            st.session_state["calibration_selected_name"] = "__reset__"
+            st.rerun()
+
+    note = st.text_input("Calibration note", value=f"Validated calibration for {selected_name}")
+    preview_stand = (float(stand_lat), float(stand_lon))
+    preview_cast = (float(cast_lat), float(cast_lon))
+    preview_parking = (float(parking_lat), float(parking_lon))
+    preview_bearing = calculate_bearing(preview_stand, preview_cast)
+    preview_distance = distance_m(preview_stand, preview_cast)
+    ok_geom, geom_errors, geom_warnings = validate_calibrated_geometry(area, preview_parking, preview_stand, preview_cast)
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Cast distance", f"{int(preview_distance)} m")
+    p2.metric("Cast bearing", f"{int(preview_bearing)}°")
+    p3.metric("Direction", bearing_to_compass(preview_bearing))
+    p4.metric("Validation", "PASS" if ok_geom else "FIX")
+
+    for warn in geom_warnings:
+        st.warning(warn)
+    for err in geom_errors:
+        st.error(err)
+
+    if st.session_state.get("last_calibration_click"):
+        st.caption(f"Last map click: {st.session_state['last_calibration_click'][0]:.7f}, {st.session_state['last_calibration_click'][1]:.7f}")
+
+    if folium and st_folium:
+        center = ((preview_stand[0] + preview_cast[0]) / 2, (preview_stand[1] + preview_cast[1]) / 2)
+        cm = folium.Map(location=center, zoom_start=18, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery",
+            name="Satellite",
+        ).add_to(cm)
+        folium.Marker(preview_parking, tooltip="Parking/access", icon=folium.Icon(color="green", icon="car", prefix="fa")).add_to(cm)
+        folium.Marker(preview_stand, tooltip="Stand here", icon=folium.DivIcon(html='<div style="font-size:34px;">🧍‍♂️</div>')).add_to(cm)
+        folium.Marker(preview_cast, tooltip="Cast target", icon=folium.Icon(color="red", icon="bullseye", prefix="fa")).add_to(cm)
+        if st.session_state.get("last_calibration_click"):
+            folium.Marker(
+                st.session_state["last_calibration_click"],
+                tooltip="Last clicked point",
+                icon=folium.Icon(color="blue", icon="crosshairs", prefix="fa"),
+            ).add_to(cm)
+        folium.PolyLine([preview_stand, preview_cast], color="blue", weight=5, dash_array="8,8", tooltip="Cast line").add_to(cm)
+        folium.Circle(preview_stand, radius=12, fill=True, tooltip="Standing zone").add_to(cm)
+        folium.Circle(preview_cast, radius=18, fill=True, tooltip="Bait landing zone").add_to(cm)
+        clicked = st_folium(
+            cm,
+            width=1200,
+            height=520,
+            key="calibration_map",
+            returned_objects=["last_clicked"],
+        )
+        if clicked and clicked.get("last_clicked"):
+            lat = float(clicked["last_clicked"]["lat"])
+            lon = float(clicked["last_clicked"]["lng"])
+            # Store the exact Leaflet map click lat/lon. No map center, no screen coords.
+            st.session_state["last_calibration_click"] = (lat, lon)
+            if action == "Standing point":
+                # ADVANCED MODE: exact click = exact standing point. No auto-shift.
+                exact_stand = (lat, lon)
+                st.session_state["cal_stand_lat"] = float(exact_stand[0])
+                st.session_state["cal_stand_lon"] = float(exact_stand[1])
+                # Auto-place cast into surf from that stand; user can then click Cast target if needed.
+                new_cast = auto_cast_from_stand(area, exact_stand, 70)
+                st.session_state["cal_cast_lat"] = float(new_cast[0])
+                st.session_state["cal_cast_lon"] = float(new_cast[1])
+            elif action == "Cast target":
+                st.session_state["cal_cast_lat"] = lat
+                st.session_state["cal_cast_lon"] = lon
+            else:
+                st.session_state["cal_parking_lat"] = lat
+                st.session_state["cal_parking_lon"] = lon
+            st.rerun()
+
+    s1, s2 = st.columns(2)
+    with s1:
+        st.link_button("Open stand in Google Maps", google_maps_url(stand_lat, stand_lon), width="stretch")
+    with s2:
+        st.link_button("Open cast target in Google Maps", google_maps_url(cast_lat, cast_lon), width="stretch")
+
+    if st.button("💾 Save validated calibration to CSV", type="primary", width="stretch", disabled=not ok_geom):
+        ok, msg = save_calibration_to_csv(
+            area=area,
+            spot_name=spot_name,
+            values={
+                "parking_lat": parking_lat,
+                "parking_lon": parking_lon,
+                "stand_lat": stand_lat,
+                "stand_lon": stand_lon,
+                "cast_lat": cast_lat,
+                "cast_lon": cast_lon,
+                "cast_distance_m": int(preview_distance),
+                "cast_bearing": int(preview_bearing),
+                "calibration_note": note,
+            },
+        )
+        if ok:
+            st.success(msg + " — cache cleared. Refresh or rerun to use the calibrated points.")
+            st.session_state["loaded_recommendation_key"] = selected_name
+        else:
+            st.error(msg)
+
+
+
+if show_dev_tools:
+    with tabs[9]:
+        st.header("🧪 Auto Test")
+        st.caption("Run this after every code change. It checks the main logic across common SA coastal locations.")
+
+        st.info(
+            "This test checks location search, ranked recommendations, confidence matching, "
+            "parking/stand/cast coordinates, bait mismatch override, weather API, and tide fallback."
+        )
+
+        if st.button("Run Auto Test", width="stretch"):
+            with st.spinner("Running CastIQ auto tests..."):
+                test_df = run_auto_tests()
+
+            status_counts = test_df["Status"].value_counts().to_dict() if not test_df.empty else {}
+            c1, c2, c3 = st.columns(3)
+            c1.metric("PASS", status_counts.get("PASS", 0))
+            c2.metric("WARN", status_counts.get("WARN", 0))
+            c3.metric("FAIL", status_counts.get("FAIL", 0))
+
+            if status_counts.get("FAIL", 0) > 0:
+                st.error("Some tests failed. Review the table below and send a screenshot.")
+            elif status_counts.get("WARN", 0) > 0:
+                st.warning("No hard failures, but warnings need review.")
+            else:
+                st.success("All auto tests passed.")
+
+            st.dataframe(test_df, width="stretch", hide_index=True)
+
+            csv = test_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download test report CSV",
+                data=csv,
+                file_name="castiq_auto_test_report.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+        with st.expander("What PASS / WARN / FAIL means"):
+            st.write("**PASS** = Logic worked as expected.")
+            st.write("**WARN** = App did not crash, but result should be reviewed manually.")
+            st.write("**FAIL** = Something is broken and should be fixed before relying on the app.")
+
+
+st.caption("Prototype only. Always verify safety, access rights, sea conditions and official fishing regulations.")
