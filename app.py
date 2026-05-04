@@ -50,27 +50,25 @@ REQUEST_HEADERS = {
 }
 
 
-# =====================================================
-# Asset loading — works on GitHub root, assets/, images/, or data/
-# =====================================================
-
 def find_asset(filename: str) -> Optional[str]:
-    """Resolve images whether stored in repo root, assets/, images/, or data/."""
+    """Find images/assets whether they are in GitHub root, assets/, images/ or data/."""
     if not filename:
         return None
+    filename = str(filename).strip()
     candidates = [
         filename,
         os.path.join("assets", filename),
         os.path.join("images", filename),
         os.path.join("data", filename),
     ]
-    base = os.path.basename(str(filename))
-    candidates.extend([
+    # Also allow callers to pass assets/foo.png and still check root foo.png
+    base = os.path.basename(filename)
+    candidates += [
         base,
         os.path.join("assets", base),
         os.path.join("images", base),
         os.path.join("data", base),
-    ])
+    ]
     seen = set()
     for path in candidates:
         if path in seen:
@@ -79,24 +77,6 @@ def find_asset(filename: str) -> Optional[str]:
         if os.path.exists(path):
             return path
     return None
-
-TRACE_IMAGES = {
-    "Kob": "kob_trace.png",
-    "Shad / Elf": "shad_trace.png",
-    "Garrick / Leervis": "garrick_trace.png",
-    "Bronze Bream": "bronze_bream_trace.png",
-    "Blacktail": "blacktail_trace.png",
-    "Spotted Grunter": "grunter_trace.png",
-    "Pompano": "pompano_trace.png",
-    "White Steenbras": "stone_bream_trace.png",
-    "Sand Steenbras": "stone_bream_trace.png",
-    "Galjoen": "stone_bream_trace.png",
-    "White Musselcracker": "bronze_bream_trace.png",
-    "Kingfish": "kingfish_trace.png",
-    "Grey Shark": "grey_shark_trace.png",
-    "Sand Shark": "sand_shark_trace.png",
-    "Spotted Gully Shark": "grey_shark_trace.png",
-}
 
 
 # =====================================================
@@ -126,7 +106,7 @@ def safe_request_json(
     url: str,
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
-    timeout: int = 12,
+    timeout: int = 3,
     retries: int = 1,
 ) -> Optional[Any]:
     hdrs = REQUEST_HEADERS.copy()
@@ -745,6 +725,84 @@ def row_get_calibrated_points(row: Any) -> Dict[str, Any]:
 def google_maps_url(lat: float, lon: float, mode: str = "walking") -> str:
     return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode={mode}"
 
+
+def force_sea_cast(area: str, stand: Tuple[float, float], distance_meters: float = 70) -> Tuple[float, float]:
+    """Cast from the standing point into the sea using stable SA coastline bearings."""
+    area_l = str(area or "").lower()
+    if any(x in area_l for x in ["umhlanga", "durban", "virginia", "ballito", "umdloti", "salt rock"]):
+        bearing = 105.0
+    elif any(x in area_l for x in ["port edward", "trafalgar", "leisure", "southbroom", "margate", "palm beach"]):
+        bearing = 122.0
+    elif any(x in area_l for x in ["port st johns", "wild coast", "coffee bay", "hole in the wall", "mbotyi", "kei"]):
+        bearing = 128.0
+    else:
+        bearing = 110.0
+    return destination_point(stand, bearing, distance_meters)
+
+
+def repair_bad_geometry(area: str, anchor: Tuple[float, float], parking: Tuple[float, float], stand: Tuple[float, float], cast: Tuple[float, float]) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], str]:
+    """
+    Emergency map repair for old/bad CSV calibration rows.
+    It prevents parking/stand from loading in the sea and always casts seaward from stand.
+    """
+    area_l = str(area or "").lower()
+    east_coast = any(x in area_l for x in [
+        "umhlanga", "durban", "virginia", "ballito", "umdloti", "salt rock",
+        "leisure", "trafalgar", "southbroom", "port edward", "palm beach", "margate",
+        "port st johns", "wild coast", "coffee bay", "mbotyi", "kei"
+    ])
+    if not east_coast or not anchor or not stand:
+        return parking, stand, cast, "CSV/manual geometry"
+
+    bad = False
+    try:
+        # Parking should be inland/west of stand on the SA east coast.
+        if parking and parking[1] > stand[1] - 0.00005:
+            bad = True
+        # Stand should not be hundreds of metres away from the source anchor unless deliberately calibrated.
+        if distance_m(anchor, stand) > 450:
+            bad = True
+        # Cast must be seaward/east of stand.
+        if cast and cast[1] <= stand[1]:
+            bad = True
+        # Deep-sea symptom: stand far east of the anchor.
+        if stand[1] - anchor[1] > 0.006:
+            bad = True
+    except Exception:
+        bad = True
+
+    if not bad:
+        # Keep stand/parking, but clean cast so bad old CSV cast points do not draw sideways.
+        return parking, stand, force_sea_cast(area, stand, 70), "CSV/manual stand + cleaned seaward cast"
+
+    # Rebuild from the original CSV/selected anchor, not from bad saved stand/cast.
+    # Move from land anchor toward surf, then place cast further seaward and parking inland.
+    if any(x in area_l for x in ["umhlanga", "durban", "virginia", "ballito", "umdloti", "salt rock"]):
+        sea_bearing, land_bearing = 105.0, 285.0
+        stand_shift = 180
+    elif any(x in area_l for x in ["port edward", "trafalgar", "leisure", "southbroom", "palm beach", "margate"]):
+        sea_bearing, land_bearing = 122.0, 302.0
+        stand_shift = 160
+    else:
+        sea_bearing, land_bearing = 128.0, 308.0
+        stand_shift = 150
+
+    safe_stand = destination_point(anchor, sea_bearing, stand_shift)
+    safe_cast = destination_point(safe_stand, sea_bearing, 70)
+    safe_parking = destination_point(safe_stand, land_bearing, 350)
+    return safe_parking, safe_stand, safe_cast, "Auto-repaired bad saved CSV geometry"
+
+
+def get_anchor_for_loaded(loaded: Dict[str, Any], fallback: Tuple[float, float]) -> Tuple[float, float]:
+    spot = loaded.get("spot", {}) if isinstance(loaded, dict) else {}
+    for a, b in [("lat", "lon"), ("latitude", "longitude")]:
+        try:
+            if _is_real_number(spot.get(a)) and _is_real_number(spot.get(b)):
+                return (float(spot.get(a)), float(spot.get(b)))
+        except Exception:
+            pass
+    return fallback
+
 def save_calibration_to_csv(area: str, spot_name: str, values: Dict[str, Any]) -> Tuple[bool, str]:
     csv_path = resolve_spots_csv_path()
     if not os.path.exists(csv_path):
@@ -876,21 +934,17 @@ def cast_for_display(area_name: str, stand: Tuple[float, float], stored_cast: Tu
 
 
 def display_cast_for_loaded(loaded: Dict[str, Any]) -> Tuple[float, float]:
-    """Always display a clean seaward cast line from the standing point.
-
-    Stand remains the source of truth. Old/manual CSV cast points can be wrong,
-    so the map line is cleaned to the expected sea bearing for the area.
-    """
+    """Return a clean display cast: stand is source of truth, cast is forced seaward."""
     stand = loaded.get("stand")
+    cast = loaded.get("cast")
     area = loaded.get("spot", {}).get("area", "")
-    stored_cast = loaded.get("cast")
     try:
-        d = distance_m(stand, stored_cast) if stored_cast else 70
+        d = distance_m(stand, cast)
         if not (30 <= d <= 140):
             d = 70
     except Exception:
         d = 70
-    return destination_point(stand, expected_sea_bearing_for_spot(area, stand), d)
+    return force_sea_cast(area, stand, d)
 
 
 def bearing_delta(a: float, b: float) -> float:
@@ -1710,6 +1764,19 @@ def snap_point_to_coast(
 
 @st.cache_data(ttl=API_CACHE_TTL_SECONDS)
 def fetch_conditions(lat, lon, trip_date_str, bucket):
+    if st.session_state.get("FAST_MODE", True):
+        return {
+            "available": False,
+            "weather_error": None,
+            "marine_error": None,
+            "wind_speed": None,
+            "wind_direction": None,
+            "wave_height": None,
+            "wave_period": None,
+            "rain_probability": None,
+            "sea_temp": None,
+            "source": "Fast mode - live weather/marine calls skipped",
+        }
     target_hour = TIME_BUCKET_HOUR.get(bucket, 12)
     result = {"available": False, "weather_error": None, "marine_error": None}
     try:
@@ -1722,7 +1789,7 @@ def fetch_conditions(lat, lon, trip_date_str, bucket):
                 "timezone": "auto",
                 "forecast_days": 10,
             },
-            retries=1,
+            retries=0,
         )
         times = w.get("hourly", {}).get("time", []) if w else []
         idx = next((i for i, t in enumerate(times) if t.startswith(trip_date_str) and int(t[11:13]) == target_hour), 0 if times else None)
@@ -1751,7 +1818,7 @@ def fetch_conditions(lat, lon, trip_date_str, bucket):
                 "timezone": "auto",
                 "forecast_days": 10,
             },
-            retries=1,
+            retries=0,
         )
         times = m.get("hourly", {}).get("time", []) if m else []
         idx = next((i for i, t in enumerate(times) if t.startswith(trip_date_str) and int(t[11:13]) == target_hour), 0 if times else None)
@@ -2645,8 +2712,10 @@ with tabs[1]:
     selected_name = get_loaded_key_from_label(st.session_state.selected_option_label)
     loaded = detailed[selected_name]
     parking, stand, cast = loaded["parking"], loaded["stand"], loaded["cast"]
-    cast = display_cast_for_loaded(loaded)
-    access_point = loaded["coast_meta"].get("access_point")
+    anchor = get_anchor_for_loaded(loaded, planning_point)
+    parking, stand, cast, geometry_note = repair_bad_geometry(loaded["spot"].get("area", ""), anchor, parking, stand, cast)
+    loaded["parking"], loaded["stand"], loaded["cast"] = parking, stand, cast
+    access_point = None
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
     cast_distance = distance_m(stand, cast)
@@ -2667,7 +2736,7 @@ with tabs[1]:
 
     st.info(
         f"Parking note: {loaded['spot'].get('parking_note', 'Use nearest legal public parking/access.')}\n\n"
-        f"Geometry source: {loaded['spot'].get('geometry_source', loaded['coast_meta'].get('coast_source', 'Not available'))}\n\n"
+        f"Geometry source: {geometry_note}\n\n"
         f"Use the navigation button to get to the standing spot. Cast {int(cast_distance)}m towards {compass}. "
         "If the standing marker is not exactly on the beach/rocks, use the Calibration tab once for this spot."
     )
@@ -2709,8 +2778,9 @@ with tabs[1]:
 with tabs[2]:
     selected_name = st.session_state.selected_option_label.split(" — ")[0]
     loaded = detailed[selected_name]
-    stand, cast = loaded["stand"], loaded["cast"]
-    cast = display_cast_for_loaded(loaded)
+    parking, stand, cast = loaded["parking"], loaded["stand"], loaded["cast"]
+    anchor = get_anchor_for_loaded(loaded, planning_point)
+    parking, stand, cast, geometry_note = repair_bad_geometry(loaded["spot"].get("area", ""), anchor, parking, stand, cast)
     bearing = calculate_bearing(stand, cast)
     compass = bearing_to_compass(bearing)
     cast_distance = distance_m(stand, cast)
@@ -2805,12 +2875,26 @@ with tabs[4]:
     st.write(f"**Trace:** {species['trace']}")
     st.code(species["trace_diagram"])
 
-    trace_image_name = TRACE_IMAGES.get(fish)
-    trace_image_path = find_asset(trace_image_name) if trace_image_name else None
-    if trace_image_path:
-        st.image(trace_image_path, caption=f"{fish} trace setup", width="stretch")
+    TRACE_IMAGES = {
+        "Kob": "kob_trace.png",
+        "Shad / Elf": "shad_trace.png",
+        "Garrick / Leervis": "garrick_trace.png",
+        "Bronze Bream": "bronze_bream_trace.png",
+        "Blacktail": "blacktail_trace.png",
+        "Spotted Grunter": "grunter_trace.png",
+        "Pompano": "pompano_trace.png",
+        "Kingfish": "kingfish_trace.png",
+        "Grey Shark": "grey_shark_trace.png",
+        "Sand Shark": "sand_shark_trace.png",
+        "Spotted Gully Shark": "grey_shark_trace.png",
+        "White Musselcracker": "stone_bream_trace.png",
+        "Galjoen": "stone_bream_trace.png",
+    }
+    trace_img = find_asset(TRACE_IMAGES.get(fish, "kob_trace.png"))
+    if trace_img:
+        st.image(trace_img, width="stretch")
     else:
-        st.warning(f"Trace image not found for {fish}. Add {trace_image_name or 'a trace image'} to root, assets/, or images/.")
+        st.warning(f"Trace image not found for {fish}. Upload the PNG to root, assets/ or images/.")
 
     st.subheader("Bite behaviour")
     st.write(f"**Bite style:** {species['bite_style']}")
@@ -2846,9 +2930,9 @@ with tabs[6]:
 
     def package_card(image_path, title, persona, price, description, features, button_label):
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
-        resolved_image = find_asset(image_path)
-        if resolved_image:
-            st.image(resolved_image, width="stretch")
+        resolved_img = find_asset(image_path)
+        if resolved_img:
+            st.image(resolved_img, width="stretch")
         else:
             st.info(f"Add image: {image_path}")
         st.subheader(title)
